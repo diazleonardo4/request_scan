@@ -197,9 +197,9 @@ def run_scan(job_id: str, cfg: ScanIn):
                                                           "valid": True, **full})
                         found += 1
                     else:
-                        _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
-                                                          "valid": False, "reason": "ValidaSolicitud returned false",
-                                                          "valida_raw": vres["valida_raw"]})
+                        #_notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
+                        #                                  "valid": False, "reason": "ValidaSolicitud returned false",
+                        #                                  "valida_raw": vres["valida_raw"]})
                         skipped += 1
                     processed += 1
                 except Exception as e:
@@ -255,10 +255,10 @@ def run_scan(job_id: str, cfg: ScanIn):
                                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid, "valid": True})
                                     found += 1
                                 else:
-                                    _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
-                                                                      "valid": False,
-                                                                      "reason": "ValidaSolicitud returned false",
-                                                                      "valida_raw": vnext["valida_raw"]})
+                                    #_notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
+                                    #                                  "valid": False,
+                                    #                                  "reason": "ValidaSolicitud returned false",
+                                    #                                  "valida_raw": vnext["valida_raw"]})
                                     skipped += 1
                                     # Stop expansion on first invalid
                                     break
@@ -275,9 +275,9 @@ def run_scan(job_id: str, cfg: ScanIn):
 
                     else:
                         # Starting point invalid → jump to next checkpoint
-                        _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
-                                                          "valid": False, "reason": "ValidaSolicitud returned false",
-                                                          "valida_raw": vres["valida_raw"]})
+                        #_notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
+                        #                                  "valid": False, "reason": "ValidaSolicitud returned false",
+                        #                                  "valida_raw": vres["valida_raw"]})
                         skipped += 1
                         i = next_checkpoint_id(i + 1)
                         if cfg.delay_ms: time.sleep(cfg.delay_ms/1000.0)
