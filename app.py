@@ -1,8 +1,9 @@
 # app.py
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, HttpUrl, Field
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 import requests, urllib.parse, json, time, uuid
+from audit_client import get_audit_for_id 
 
 BASE = "https://servicios.energiacaribemar.co"
 
@@ -320,3 +321,114 @@ def scan_range(body: ScanIn, bg: BackgroundTasks):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+class AuditBatchIn(BaseModel):
+    ids: List[int] = Field(..., description="List of ID_SOLICITUD values")
+    webhook_url: Optional[HttpUrl] = Field(None, description="Post each result to this URL")
+    timeout_s: int = Field(30, ge=5)
+    max_retries: int = Field(2, ge=0)
+    delay_ms: int = Field(25, ge=0, description="Tiny pause between IDs (ms) to be gentle with server")
+    notify_invalid: bool = Field(False, description="If true, also post invalid IDs to webhook")
+
+class AuditBatchSummary(BaseModel):
+    processed: int
+    found: int
+    skipped: int
+    errors: int
+    duration_s: float
+
+@app.post("/audit/batch", response_model=AuditBatchSummary)
+def audit_batch(body: AuditBatchIn):
+    """
+    Processes many IDs, posts each result to webhook (streaming),
+    returns only a small summary (no huge array in the HTTP response).
+    """
+    if not body.ids:
+        return AuditBatchSummary(processed=0, found=0, skipped=0, errors=0, duration_s=0.0)
+
+    t0 = time.time()
+    processed = found = skipped = errors = 0
+
+    sess = requests.Session()
+
+    # optional start ping
+    if body.webhook_url:
+        try:
+            sess.post(body.webhook_url, json={
+                "event": "audit_started",
+                "count": len(body.ids),
+            }, timeout=10)
+        except Exception:
+            pass
+
+    try:
+        for the_id in body.ids:
+            try:
+                res = get_audit_for_id(
+                    the_id,
+                    timeout_s=body.timeout_s,
+                    max_retries=body.max_retries,
+                    webhook_url=None,  # we control webhook posting here
+                    session=sess
+                )
+                processed += 1
+
+                is_valid = bool(res.get("valid"))
+                if is_valid:
+                    found += 1
+                else:
+                    skipped += 1
+
+                if body.webhook_url and (is_valid or body.notify_invalid):
+                    # Stream each result to your webhook; no accumulation server-side
+                    try:
+                        sess.post(body.webhook_url, json={
+                            "event": "audit_item",
+                            **res
+                        }, timeout=15)
+                    except Exception:
+                        # Don't fail the batch if the webhook hiccups
+                        pass
+
+            except Exception as e:
+                errors += 1
+                if body.webhook_url:
+                    try:
+                        sess.post(body.webhook_url, json={
+                            "event": "item_error",
+                            "id": str(the_id),
+                            "error": str(e),
+                        }, timeout=10)
+                    except Exception:
+                        pass
+
+            # small delay to avoid hammering the remote site
+            if body.delay_ms:
+                time.sleep(body.delay_ms / 1000.0)
+
+    finally:
+        # optional finish ping
+        if body.webhook_url:
+            try:
+                sess.post(body.webhook_url, json={
+                    "event": "audit_finished",
+                    "stats": {
+                        "processed": processed,
+                        "found": found,
+                        "skipped": skipped,
+                        "errors": errors,
+                        "duration_s": round(time.time() - t0, 3)
+                    }
+                }, timeout=10)
+            except Exception:
+                pass
+        sess.close()
+
+    return AuditBatchSummary(
+        processed=processed,
+        found=found,
+        skipped=skipped,
+        errors=errors,
+        duration_s=round(time.time() - t0, 3)
+    )
