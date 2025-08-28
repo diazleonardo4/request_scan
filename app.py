@@ -2,7 +2,7 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, Any, Dict, List
-import requests, urllib.parse, json, time, uuid
+import requests, urllib.parse, json, time, uuid, threading
 from audit_client import get_audit_for_id 
 
 BASE = "https://servicios.energiacaribemar.co"
@@ -323,112 +323,102 @@ def health():
     return {"ok": True}
 
 
-class AuditBatchIn(BaseModel):
-    ids: List[int] = Field(..., description="List of ID_SOLICITUD values")
-    webhook_url: Optional[HttpUrl] = Field(None, description="Post each result to this URL")
+JOBS = {}
+
+class AuditEnqueueIn(BaseModel):
+    ids: List[int] = Field(..., description="All ID_SOLICITUD values")
+    webhook_url: HttpUrl
     timeout_s: int = Field(30, ge=5)
     max_retries: int = Field(2, ge=0)
-    delay_ms: int = Field(25, ge=0, description="Tiny pause between IDs (ms) to be gentle with server")
-    notify_invalid: bool = Field(False, description="If true, also post invalid IDs to webhook")
+    delay_ms: int = Field(25, ge=0)        # gentle throttle to avoid rate limits
+    notify_invalid: bool = False           # include invalid IDs in webhook?
 
-class AuditBatchSummary(BaseModel):
-    processed: int
-    found: int
-    skipped: int
-    errors: int
-    duration_s: float
+class AuditEnqueueOut(BaseModel):
+    job_id: str
+    accepted: bool = True
 
-@app.post("/audit/batch", response_model=AuditBatchSummary)
-def audit_batch(body: AuditBatchIn):
-    """
-    Processes many IDs, posts each result to webhook (streaming),
-    returns only a small summary (no huge array in the HTTP response).
-    """
-    if not body.ids:
-        return AuditBatchSummary(processed=0, found=0, skipped=0, errors=0, duration_s=0.0)
-
+def _run_audit_job(job_id: str, cfg: AuditEnqueueIn):
+    sess = requests.Session()
     t0 = time.time()
     processed = found = skipped = errors = 0
 
-    sess = requests.Session()
-
-    # optional start ping
-    if body.webhook_url:
-        try:
-            sess.post(body.webhook_url, json={
-                "event": "audit_started",
-                "count": len(body.ids),
-            }, timeout=10)
-        except Exception:
-            pass
+    # started
+    try:
+        sess.post(cfg.webhook_url, json={
+            "event": "audit_started", "job_id": job_id, "count": len(cfg.ids)
+        }, timeout=10)
+    except Exception:
+        pass
 
     try:
-        for the_id in body.ids:
+        for the_id in cfg.ids:
             try:
                 res = get_audit_for_id(
                     the_id,
-                    timeout_s=body.timeout_s,
-                    max_retries=body.max_retries,
-                    webhook_url=None,  # we control webhook posting here
+                    timeout_s=cfg.timeout_s,
+                    max_retries=cfg.max_retries,
+                    webhook_url=None,      # prevent double posts
                     session=sess
                 )
                 processed += 1
-
                 is_valid = bool(res.get("valid"))
+
                 if is_valid:
                     found += 1
                 else:
                     skipped += 1
 
-                if body.webhook_url and (is_valid or body.notify_invalid):
-                    # Stream each result to your webhook; no accumulation server-side
+                if cfg.webhook_url and (is_valid or cfg.notify_invalid):
                     try:
-                        sess.post(body.webhook_url, json={
+                        sess.post(cfg.webhook_url, json={
                             "event": "audit_item",
+                            "job_id": job_id,
                             **res
                         }, timeout=15)
                     except Exception:
-                        # Don't fail the batch if the webhook hiccups
                         pass
 
             except Exception as e:
                 errors += 1
-                if body.webhook_url:
+                if cfg.webhook_url:
                     try:
-                        sess.post(body.webhook_url, json={
+                        sess.post(cfg.webhook_url, json={
                             "event": "item_error",
+                            "job_id": job_id,
                             "id": str(the_id),
                             "error": str(e),
                         }, timeout=10)
                     except Exception:
                         pass
 
-            # small delay to avoid hammering the remote site
-            if body.delay_ms:
-                time.sleep(body.delay_ms / 1000.0)
+            if cfg.delay_ms:
+                time.sleep(cfg.delay_ms / 1000.0)
 
     finally:
-        # optional finish ping
-        if body.webhook_url:
+        duration = round(time.time() - t0, 3)
+        if cfg.webhook_url:
             try:
-                sess.post(body.webhook_url, json={
+                sess.post(cfg.webhook_url, json={
                     "event": "audit_finished",
+                    "job_id": job_id,
                     "stats": {
                         "processed": processed,
                         "found": found,
                         "skipped": skipped,
                         "errors": errors,
-                        "duration_s": round(time.time() - t0, 3)
+                        "duration_s": duration
                     }
                 }, timeout=10)
             except Exception:
                 pass
         sess.close()
+        JOBS[job_id] = {"done": True, "stats": {"processed": processed, "found": found, "skipped": skipped, "errors": errors, "duration_s": duration}}
 
-    return AuditBatchSummary(
-        processed=processed,
-        found=found,
-        skipped=skipped,
-        errors=errors,
-        duration_s=round(time.time() - t0, 3)
-    )
+@app.post("/audit/batch", response_model=AuditEnqueueOut)
+def audit_enqueue(body: AuditEnqueueIn):
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"done": False}
+    t = threading.Thread(target=_run_audit_job, args=(job_id, body), daemon=True)
+    t.start()
+    # immediate, small response so Apps Script never waits
+    return AuditEnqueueOut(job_id=job_id, accepted=True)
