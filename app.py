@@ -2,12 +2,81 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, Any, Dict, List
-import requests, urllib.parse, json, time, uuid, threading
+import os,requests, urllib.parse, json, time, uuid, threading
 from audit_client import get_audit_for_id 
+from typing import Literal,NamedTuple
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3 import PoolManager
 
-BASE = "https://servicios.energiacaribemar.co"
+AIRE_CA_BUNDLE = os.getenv("AIRE_CA_BUNDLE", "/app/aire_ca_bundle.pem")
 
-app = FastAPI(title="EnergiaCaribe Range Scanner")
+Operator = Literal["afinia","aire"]
+
+
+class UnsafeAdapter(HTTPAdapter):
+    """Adapter that also supports legacy renegotiation; can be made fully insecure if requested."""
+    def __init__(self, *, insecure: bool = False, **kwargs):
+        self.insecure = insecure
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        if self.insecure:
+            # Fully insecure context (hostname off + no cert verification)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        else:
+            # Normal verification context
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        # Allow legacy renegotiation (needed by servicios.air-e.com)
+        ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+def make_session_for_operator(operator: str, insecure_verify: bool = False) -> requests.Session:
+    s = requests.Session()
+    if operator == "aire":
+        # Mount adapter for ALL https calls; choose secure (default) or fully insecure (last resort)
+        s.mount("https://", UnsafeAdapter(insecure=insecure_verify))
+        if not insecure_verify:
+            # keep verification ON with a reliable CA bundle
+            s.verify = AIRE_CA_BUNDLE
+    else:
+        # Afinia: standard TLS verification
+        s.verify = certifi.where()
+    return s
+
+class Site(NamedTuple):
+    base: str            # scheme+host
+    root_path: str       # "/Autogeneracion" (Afinia) or "/CREG174" (Air-e)
+    home_referer: str    # base + root_path + "/"
+    form_page: str       # root_path + "/form/WFSolicitud.aspx"
+    consulta_page: str   # root_path + "/WFConsulta.aspx"
+    ua: str = "Mozilla/5.0"
+
+def get_site(op: Operator) -> Site:
+    if op == "aire":
+        base = "https://servicios.air-e.com"
+        root = "/CREG174"
+    else:  # default "afinia"
+        base = "https://servicios.energiacaribemar.co"
+        root = "/Autogeneracion"
+    return Site(
+        base=base,
+        root_path=root,
+        home_referer=f"{base}{root}/",
+        form_page=f"{root}/form/WFSolicitud.aspx",
+        consulta_page=f"{root}/WFConsulta.aspx",
+    )
+
+
+
+app = FastAPI(title="Afinia/Aire Range Scanner")
+
+
 
 class ScanIn(BaseModel):
     start_id: int = Field(..., description="Inclusive start ID, e.g., 40000")
@@ -22,6 +91,7 @@ class ScanIn(BaseModel):
     delay_ms: int = Field(200, ge=0, description="Optional per-ID delay")
     max_retries: int = Field(2, ge=0, description="Retries per HTTP call")
     timeout_s: int = Field(30, ge=5, description="HTTP timeout seconds")
+    operator: Operator = Field("afinia", description="Which operator: 'afinia' or 'aire'")
 
 # ---------- utilities ----------
 def _unwrap_d(obj: Any) -> Any:
@@ -103,45 +173,46 @@ def _get_with_retries(s: requests.Session, url: str, *, headers: Dict[str,str],
     raise last
 
 # ---------- fast validity check ----------
-def validate_only(s: requests.Session, *, id_solicitud: str,
-                  timeout_s: int, max_retries: int) -> Dict[str, Any]:
-    common = {
-        "User-Agent": "Mozilla/5.0",
-        "Origin": BASE,
+def validate_only(s: requests.Session, *, site: Site, id_solicitud: str, timeout_s: int, max_retries: int):
+    headers = {
+        "User-Agent": site.ua,
+        "Origin": site.base,
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json; charset=UTF-8",
+        "Referer": site.home_referer,
     }
-    r1 = _post_json_with_retries(
-        s,
-        f"{BASE}/Autogeneracion/WFConsulta.aspx/ValidaSolicitud",
+    r = _post_json_with_retries(
+        s, f"{site.base}{site.consulta_page}/ValidaSolicitud",
         json_body={"ID_SOLICITUD": id_solicitud, "EMAIL": ""},
-        headers={**common, "Content-Type": "application/json; charset=UTF-8",
-                 "Referer": f"{BASE}/Autogeneracion/"},
-        timeout=timeout_s,
-        retries=max_retries,
+        headers=headers, timeout=timeout_s, retries=max_retries
     )
-    valida_res = _unwrap_d(r1.json())
-    return {"valid": _boolish(valida_res), "valida_raw": valida_res}
+    raw = _unwrap_d(r.json())
+    valid = (str(raw).strip().lower() in ("true", "1", "si", "sí", "ok", "yes", "y")) if isinstance(raw, str) else bool(raw)
+    return {"valid": valid, "valida_raw": raw}
 
 # ---------- full load for valid IDs ----------
-def load_valid_id_full(s: requests.Session, *, id_solicitud: str,
+def load_valid_id_full(s: requests.Session, *,site: Site, id_solicitud: str,
                        timeout_s: int, max_retries: int) -> Dict[str, Any]:
-    common = {
-        "User-Agent": "Mozilla/5.0",
-        "Origin": BASE,
+    
+
+    headers = {
+        "User-Agent": site.ua,
+        "Origin": site.base,
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json; charset=UTF-8",
+        "Referer": site.home_referer,
     }
+
 
     # We already did ValidaSolicitud in the caller, but doing it again is cheap; skip here.
 
     # Encrypt
     r2 = _post_json_with_retries(
-        s,
-        f"{BASE}/Autogeneracion/WFConsulta.aspx/Encryptar",
+        s, f"{site.base}{site.consulta_page}/Encryptar",
         json_body={"strParameter": f"ID_SOLICITUD={id_solicitud}"},
-        headers={**common, "Content-Type": "application/json; charset=UTF-8",
-                 "Referer": f"{BASE}/Autogeneracion/"},
+        headers=headers,
         timeout=timeout_s,
         retries=max_retries,
     )
@@ -151,19 +222,18 @@ def load_valid_id_full(s: requests.Session, *, id_solicitud: str,
 
     # GET form to prime page-level state
     enc_qs_encoded = urllib.parse.quote(enc_qs_raw, safe="=?&")
-    form_url = f"{BASE}/Autogeneracion/form/WFSolicitud.aspx{enc_qs_encoded}"
+    form_url = f"{site.base}{site.form_page}{enc_qs_encoded}"
     _get_with_retries(
         s, form_url,
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers={"User-Agent": site.ua},
         timeout=timeout_s, retries=max_retries
     )
 
     # Page method: CargarDatosSolicitud (force zero-length body)
-    url_cargar = f"{BASE}/Autogeneracion/form/WFSolicitud.aspx/CargarDatosSolicitud"
+    url_cargar = f"{site.base}{site.form_page}/CargarDatosSolicitud"
     r4 = s.post(
         url_cargar,
-        headers={**common, "Content-Type": "application/json; charset=utf-8",
-                 "Referer": form_url},
+        headers=headers,
         timeout=timeout_s,
         data=b"",  # Content-Length: 0
     )
@@ -177,11 +247,14 @@ def run_scan(job_id: str, cfg: ScanIn):
         "job_id": job_id,
         "range": {"start": cfg.start_id, "end": cfg.end_id, "strategy": cfg.strategy}
     })
+    site = get_site(cfg.operator)
 
-    s = requests.Session()
+    
+    s: Optional[requests.Session] = None
     processed = found = skipped = errors = 0
 
     try:
+        s = make_session_for_operator(cfg.operator,False)  # <-- use our factory
         if cfg.strategy == "linear":
             # Fallback: simple linear scan (optional)
             i = cfg.start_id
@@ -189,13 +262,13 @@ def run_scan(job_id: str, cfg: ScanIn):
             while (i <= cfg.end_id) if step > 0 else (i >= cfg.end_id):
                 id_str = str(i)
                 try:
-                    vres = validate_only(s, id_solicitud=id_str,
+                    vres = validate_only(s, site=site,id_solicitud=id_str,
                                          timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                     if vres["valid"] and cfg.fetch_data_for_valid:
-                        full = load_valid_id_full(s, id_solicitud=id_str,
+                        full = load_valid_id_full(s, site=site,id_solicitud=id_str,
                                                   timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
-                                                          "valid": True, **full})
+                                                          "valid": True, "operator":cfg.operator, **full})
                         found += 1
                     else:
                         #_notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
@@ -221,7 +294,7 @@ def run_scan(job_id: str, cfg: ScanIn):
 
                 id_str = str(i)
                 try:
-                    vres = validate_only(s, id_solicitud=id_str,
+                    vres = validate_only(s, site=site,id_solicitud=id_str,
                                          timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                     processed += 1
 
@@ -234,24 +307,24 @@ def run_scan(job_id: str, cfg: ScanIn):
                             # For the first one we already validated; fetch data if requested
                             if j == i:
                                 if cfg.fetch_data_for_valid:
-                                    full = load_valid_id_full(s, id_solicitud=jid,
+                                    full = load_valid_id_full(s, site=site,id_solicitud=jid,
                                                               timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                                     _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
-                                                                      "valid": True, **full})
+                                                                      "valid": True,"operator":cfg.operator, **full})
                                 else:
                                     _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid, "valid": True})
                                 found += 1
                             else:
                                 # Validate next sequential id
-                                vnext = validate_only(s, id_solicitud=jid,
+                                vnext = validate_only(s, site=site,id_solicitud=jid,
                                                       timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                                 processed += 1
                                 if vnext["valid"]:
                                     if cfg.fetch_data_for_valid:
-                                        full = load_valid_id_full(s, id_solicitud=jid,
+                                        full = load_valid_id_full(s, site=site,id_solicitud=jid,
                                                                   timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
-                                                                          "valid": True, **full})
+                                                                          "valid": True,"operator":cfg.operator, **full})
                                     else:
                                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid, "valid": True})
                                     found += 1
@@ -300,6 +373,8 @@ def run_scan(job_id: str, cfg: ScanIn):
             "job_id": job_id,
             "stats": {"processed": processed, "found": found, "skipped": skipped, "errors": errors}
         })
+        if s is not None:
+            s.close()
 
 # ---------- API ----------
 @app.post("/scan/range")
@@ -326,12 +401,13 @@ def health():
 JOBS = {}
 
 class AuditEnqueueIn(BaseModel):
-    ids: List[int] = Field(..., description="All ID_SOLICITUD values")
+    ids: List[int]
+    operator: Operator = "afinia"         # NEW
     webhook_url: HttpUrl
     timeout_s: int = Field(30, ge=5)
     max_retries: int = Field(2, ge=0)
-    delay_ms: int = Field(25, ge=0)        # gentle throttle to avoid rate limits
-    notify_invalid: bool = False           # include invalid IDs in webhook?
+    delay_ms: int = Field(25, ge=0)
+    notify_invalid: bool = False
 
 class AuditEnqueueOut(BaseModel):
     job_id: str
@@ -355,6 +431,7 @@ def _run_audit_job(job_id: str, cfg: AuditEnqueueIn):
             try:
                 res = get_audit_for_id(
                     the_id,
+                    operator=cfg.operator,  
                     timeout_s=cfg.timeout_s,
                     max_retries=cfg.max_retries,
                     webhook_url=None,      # prevent double posts

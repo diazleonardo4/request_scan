@@ -6,10 +6,35 @@ import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from typing import Literal, NamedTuple
+Operator = Literal["afinia", "aire"]
+
+class Site(NamedTuple):
+    base: str            # scheme+host
+    root_path: str       # "/Autogeneracion" (Afinia) or "/CREG174" (Air-e)
+    home_referer: str    # base + root_path + "/"
+    form_page: str       # root_path + "/form/WFSolicitud.aspx"
+    consulta_page: str   # root_path + "/WFConsulta.aspx"
+    ua: str = "Mozilla/5.0"
+
+def get_site(op: Operator) -> Site:
+    if op == "aire":
+        base = "https://servicios.air-e.com"
+        root = "/CREG174"
+    else:  # default "afinia"
+        base = "https://servicios.energiacaribemar.co"
+        root = "/Autogeneracion"
+    return Site(
+        base=base,
+        root_path=root,
+        home_referer=f"{base}{root}/",
+        form_page=f"{root}/form/WFSolicitud.aspx",
+        consulta_page=f"{root}/WFConsulta.aspx",
+    )
 
 
-BASE = "https://servicios.energiacaribemar.co"
-UA = "Mozilla/5.0"  # keep browser-y
+
+
 
 
 # ------------------------- Low-level helpers -------------------------
@@ -74,97 +99,60 @@ def _get_with_retries(
 
 # ------------------------- Site-specific helpers -------------------------
 
-def validate_only(
-    s: requests.Session,
-    *,
-    id_solicitud: str,
-    timeout_s: int,
-    max_retries: int
-) -> Dict[str, Any]:
-    """Fast validity check (no data load)."""
+def validate_only(s: requests.Session, *, site: Site, id_solicitud: str, timeout_s: int, max_retries: int):
     headers = {
-        "User-Agent": UA,
-        "Origin": BASE,
+        "User-Agent": site.ua,
+        "Origin": site.base,
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/json; charset=UTF-8",
-        "Referer": f"{BASE}/Autogeneracion/",
+        "Referer": site.home_referer,
     }
     r = _post_json_with_retries(
-        s,
-        f"{BASE}/Autogeneracion/WFConsulta.aspx/ValidaSolicitud",
+        s, f"{site.base}{site.consulta_page}/ValidaSolicitud",
         json_body={"ID_SOLICITUD": id_solicitud, "EMAIL": ""},
-        headers=headers,
-        timeout=timeout_s,
-        retries=max_retries,
+        headers=headers, timeout=timeout_s, retries=max_retries
     )
     raw = _unwrap_d(r.json())
-    # Server returns various truthy/falsey forms; normalize to bool
-    valid = False
-    if isinstance(raw, bool):
-        valid = raw
-    elif isinstance(raw, str):
-        valid = raw.strip().lower() in ("true", "1", "si", "sí", "ok", "yes", "y")
-    elif raw is not None:
-        valid = bool(raw)
+    valid = (str(raw).strip().lower() in ("true", "1", "si", "sí", "ok", "yes", "y")) if isinstance(raw, str) else bool(raw)
     return {"valid": valid, "valida_raw": raw}
 
 
-def encrypt_for_id(
-    s: requests.Session,
-    *,
-    id_solicitud: str,
-    timeout_s: int,
-    max_retries: int
-) -> str:
+
+def encrypt_for_id(s: requests.Session, *, site: Site, id_solicitud: str, timeout_s: int, max_retries: int) -> str:
     headers = {
-        "User-Agent": UA,
-        "Origin": BASE,
+        "User-Agent": site.ua,
+        "Origin": site.base,
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/json; charset=UTF-8",
-        "Referer": f"{BASE}/Autogeneracion/",
+        "Referer": site.home_referer,
     }
     r = _post_json_with_retries(
-        s,
-        f"{BASE}/Autogeneracion/WFConsulta.aspx/Encryptar",
+        s, f"{site.base}{site.consulta_page}/Encryptar",
         json_body={"strParameter": f"ID_SOLICITUD={id_solicitud}"},
-        headers=headers,
-        timeout=timeout_s,
-        retries=max_retries,
+        headers=headers, timeout=timeout_s, retries=max_retries
     )
     enc_qs = _unwrap_d(r.json())
-    if not isinstance(enc_qs, str) or not enc_qs.startswith("?enc="):
-        raise RuntimeError(f"Encryptar returned unexpected payload: {enc_qs!r}")
+    if not (isinstance(enc_qs, str) and enc_qs.startswith("?enc=")):
+        raise RuntimeError(f"Encryptar unexpected payload: {enc_qs!r}")
     return enc_qs
 
 
-def prime_form(
-    s: requests.Session,
-    *,
-    enc_qs: str,
-    timeout_s: int,
-    max_retries: int
-) -> str:
-    """GET the WFSolicitud.aspx?enc=... to set page/session context. Returns the full form URL used."""
+
+def prime_form(s: requests.Session, *, site: Site, enc_qs: str, timeout_s: int, max_retries: int) -> str:
     enc_qs_encoded = urllib.parse.quote(enc_qs, safe="=?&")
-    form_url = f"{BASE}/Autogeneracion/form/WFSolicitud.aspx{enc_qs_encoded}"
-    _get_with_retries(s, form_url, headers={"User-Agent": UA}, timeout=timeout_s, retries=max_retries)
+    form_url = f"{site.base}{site.form_page}{enc_qs_encoded}"
+    _get_with_retries(s, form_url, headers={"User-Agent": site.ua}, timeout=timeout_s, retries=max_retries)
     return form_url
 
 
-def load_auditoria(
-    s: requests.Session,
-    *,
-    form_url: str,
-    timeout_s: int,
-    max_retries: int
-) -> List[Dict[str, Any]]:
-    """POST .../WFSolicitud.aspx/CargarDatosAuditoria with zero-length body; Referer must be the exact ?enc=... page."""
+
+def load_auditoria(s: requests.Session, *, site: Site, form_url: str, timeout_s: int, max_retries: int):
     url = form_url.rsplit("?", 1)[0] + "/CargarDatosAuditoria"
     headers = {
-        "User-Agent": UA,
-        "Origin": BASE,
+        "User-Agent": site.ua,
+        "Origin": site.base,
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/json; charset=utf-8",
@@ -173,13 +161,10 @@ def load_auditoria(
     r = s.post(url, headers=headers, data=b"", timeout=timeout_s)
     r.raise_for_status()
     data = _unwrap_d(r.json())
-    if data is None:
-        return []
-    if isinstance(data, list):
-        return data
-    # Some pages return stringified JSON in "d"
+    if data is None: return []
+    if isinstance(data, list): return data
     if isinstance(data, str):
-        try:
+        try: 
             j = json.loads(data)
             return j if isinstance(j, list) else []
         except Exception:
@@ -189,53 +174,33 @@ def load_auditoria(
 
 # ------------------------- Public function -------------------------
 
-def get_audit_for_id(
-    id_solicitud: int | str,
-    *,
-    timeout_s: int = 30,
-    max_retries: int = 2,
-    webhook_url: Optional[str] = None,
-    session: Optional[requests.Session] = None,
-    emit_webhook=False
-) -> Dict[str, Any]:
-    """
-    High-level convenience:
-    - Validates ID
-    - Encrypts & primes form
-    - Calls CargarDatosAuditoria
-    - Optionally POSTs the result to a webhook
-
-    Returns:
-      { "id": <int>, "valid": <bool>, "referer_used": <str|None>, "audit": <list>|None }
-    """
-    own_session = False
+def get_audit_for_id(id_solicitud: int | str, *, operator: Operator = "afinia",
+                     timeout_s: int = 30, max_retries: int = 2,
+                     webhook_url: Optional[str] = None, session: Optional[requests.Session] = None,
+                     emit_webhook: bool = False) -> Dict[str, Any]:
+    site = get_site(operator)
+    own = False
     if session is None:
-        session = requests.Session()
-        own_session = True
-
+        session = requests.Session(); own = True
     try:
         id_str = str(id_solicitud)
-
-        v = validate_only(session, id_solicitud=id_str, timeout_s=timeout_s, max_retries=max_retries)
+        v = validate_only(session, site=site, id_solicitud=id_str, timeout_s=timeout_s, max_retries=max_retries)
         if not v["valid"]:
             if webhook_url and emit_webhook:
                 _notify(webhook_url, "audit_item", {"id": id_str, "valid": False, "reason": "invalid_id"})
-            return {"id": int(id_solicitud), "valid": False, "referer_used": None, "audit": None}
+            return {"id": int(id_solicitud), "valid": False, "referer_used": None, "audit": None, "operator": operator}
 
-        enc_qs = encrypt_for_id(session, id_solicitud=id_str, timeout_s=timeout_s, max_retries=max_retries)
-        form_url = prime_form(session, enc_qs=enc_qs, timeout_s=timeout_s, max_retries=max_retries)
-        audit = load_auditoria(session, form_url=form_url, timeout_s=timeout_s, max_retries=max_retries)
+        enc_qs = encrypt_for_id(session, site=site, id_solicitud=id_str, timeout_s=timeout_s, max_retries=max_retries)
+        form_url = prime_form(session, site=site, enc_qs=enc_qs, timeout_s=timeout_s, max_retries=max_retries)
+        audit = load_auditoria(session, site=site, form_url=form_url, timeout_s=timeout_s, max_retries=max_retries)
 
         if webhook_url and emit_webhook:
-            _notify(webhook_url, "audit_item", {
-                "id": id_str, "valid": True, "referer_used": form_url, "audit": audit or []
-            })
+            _notify(webhook_url, "audit_item", {"id": id_str, "valid": True, "referer_used": form_url, "audit": audit or [], "operator": operator})
 
-        return {"id": int(id_solicitud), "valid": True, "referer_used": form_url, "audit": audit or []}
-
+        return {"id": int(id_solicitud), "valid": True, "referer_used": form_url, "audit": audit or [], "operator": operator}
     finally:
-        if own_session:
-            session.close()
+        if own: session.close()
+
 
 
 # ------------------------- Optional: simple notifier -------------------------
