@@ -8,6 +8,7 @@ from typing import Literal,NamedTuple
 import ssl
 from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
+import certifi
 
 AIRE_CA_BUNDLE = os.getenv("AIRE_CA_BUNDLE", "/app/aire_ca_bundle.pem")
 
@@ -414,7 +415,11 @@ class AuditEnqueueOut(BaseModel):
     accepted: bool = True
 
 def _run_audit_job(job_id: str, cfg: AuditEnqueueIn):
-    sess = requests.Session()
+    
+ 
+
+    sess: Optional[requests.Session] = None
+    sess = make_session_for_operator(cfg.operator,False)
     t0 = time.time()
     processed = found = skipped = errors = 0
 

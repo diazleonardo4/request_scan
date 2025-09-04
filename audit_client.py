@@ -5,9 +5,11 @@ import time
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+import requests, os
 from typing import Literal, NamedTuple
 Operator = Literal["afinia", "aire"]
+
+
 
 class Site(NamedTuple):
     base: str            # scheme+host
@@ -31,10 +33,6 @@ def get_site(op: Operator) -> Site:
         form_page=f"{root}/form/WFSolicitud.aspx",
         consulta_page=f"{root}/WFConsulta.aspx",
     )
-
-
-
-
 
 
 # ------------------------- Low-level helpers -------------------------
