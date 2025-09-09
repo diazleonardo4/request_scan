@@ -248,7 +248,7 @@ def get_status_for_id(
     site = get_site(operator)
     own = False
     if session is None:
-        session = make_session_for_operator(operator)
+        session = requests.Session()
         own = True
     try:
         id_str = str(id_solicitud)

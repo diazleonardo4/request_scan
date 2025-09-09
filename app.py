@@ -4,7 +4,7 @@ from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, Any, Dict, List, Literal,NamedTuple
 import os,requests, urllib.parse, json, time, uuid, threading
 from audit_client import (
-    make_session_for_operator, get_site,
+    get_site,
     get_audit_for_id,  
     get_status_for_id, load_auditoria, filter_audit_since
 )
@@ -582,7 +582,7 @@ def status_refresh(body: StatusRefreshIn):
                 live_text = (live.get("status_text") or "").strip() if live.get("status_text") else None
                 old_code = it.last_status_code
                 old_text = (it.last_status_text or "").strip() if it.last_status_text else None
-
+                 
                 # 2) did it change? (compare text if present; else compare code)
                 changed_now = False
                 if old_text is not None and live_text is not None:
@@ -610,7 +610,6 @@ def status_refresh(body: StatusRefreshIn):
                         requests.post(body.webhook_url, json={
                             "event": "status_change",
                             "id": it.id,
-                            "operator": op,
                             "old_status_text": old_text,
                             "old_status_code": old_code,
                             "new_status_text": live_text,
@@ -618,7 +617,7 @@ def status_refresh(body: StatusRefreshIn):
                             "audit": audit or []
                         }, timeout=15)
                     except Exception:
-                        pass
+                        print(str(e))
 
                 # be gentle
                 if body.delay_ms:
@@ -648,6 +647,7 @@ def status_refresh(body: StatusRefreshIn):
                     "duration_s": round(time.time() - t0, 3)
                 }
             }, timeout=10)
+            
         except Exception:
             pass
 
