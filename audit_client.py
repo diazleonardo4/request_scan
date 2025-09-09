@@ -5,7 +5,7 @@ import time
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests, os
+import requests, os, ssl
 from typing import Literal, NamedTuple
 Operator = Literal["afinia", "aire"]
 
@@ -210,18 +210,87 @@ def _notify(url: str, event: str, payload: Dict[str, Any]) -> None:
         # best-effort only
         pass
 
+#----------------------- Update Status------------------------------------
 
-# ------------------------- CLI usage (optional) -------------------------
 
-#if __name__ == "__main__":
-#    import argparse, pprint
-#    ap = argparse.ArgumentParser(description="Fetch CargarDatosAuditoria for a single ID")
-#    ap.add_argument("id", type=int)
-#    ap.add_argument("--webhook", type=str, default=None)
-#    ap.add_argument("--timeout", type=int, default=30)
-#    ap.add_argument("--retries", type=int, default=2)
-#    args = ap.parse_args()
-#
-#    pp = pprint.PrettyPrinter()
-#    res = get_audit_for_id(args.id, timeout_s=args.timeout, max_retries=args.retries, webhook_url=args.webhook)
-#    pp.pprint(res)
+def cargar_datos_solicitud(sess: requests.Session, *, site, form_url: str, timeout_s: int, max_retries: int) -> Optional[Dict[str, Any]]:
+    """
+    Calls .../CargarDatosSolicitud and returns the first object (or None).
+    """
+    url = form_url.rsplit("?", 1)[0] + "/CargarDatosSolicitud"
+    headers = {
+        "User-Agent": site.ua,
+        "Origin": site.base,
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json; charset=utf-8",
+        "Referer": form_url,
+    }
+    r = sess.post(url, headers=headers, data=b"", timeout=timeout_s)
+    r.raise_for_status()
+    data = _unwrap_d(r.json())
+    if isinstance(data, list) and data:
+        return data[0]
+    return None
+
+def get_status_for_id(
+    id_solicitud: int | str,
+    *,
+    operator: str,
+    timeout_s: int = 30,
+    max_retries: int = 2,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """
+    Returns {"id", "valid", "status_code", "status_text", "referer_used"}.
+    If invalid, returns valid=False and no status.
+    """
+    site = get_site(operator)
+    own = False
+    if session is None:
+        session = make_session_for_operator(operator)
+        own = True
+    try:
+        id_str = str(id_solicitud)
+
+        v = validate_only(session, site=site, id_solicitud=id_str, timeout_s=timeout_s, max_retries=max_retries)
+        if not v["valid"]:
+            return {"id": int(id_solicitud), "valid": False, "status_code": None, "status_text": None, "referer_used": None}
+
+        enc_qs  = encrypt_for_id(session, site=site, id_solicitud=id_str, timeout_s=timeout_s, max_retries=max_retries)
+        form_url = prime_form(session, site=site, enc_qs=enc_qs, timeout_s=timeout_s, max_retries=max_retries)
+
+        datos = cargar_datos_solicitud(session, site=site, form_url=form_url, timeout_s=timeout_s, max_retries=max_retries)
+        status_code = None
+        status_text = None
+        if datos:
+            # Both fields exist in your earlier sample payload
+            status_code = datos.get("ESTADO")
+            status_text = datos.get("DESC_ESTADO")
+        return {
+            "id": int(id_solicitud),
+            "valid": True,
+            "status_code": status_code,
+            "status_text": status_text,
+            "referer_used": form_url,
+        }
+    finally:
+        if own:
+            session.close()
+
+def filter_audit_since(audit_list, cutoff_ms: Optional[int]):
+    """Filter auditoría entries by FECHA_AUDITORIA >= cutoff (ms). If cutoff_ms is None, returns original list."""
+    if not audit_list or cutoff_ms is None:
+        return audit_list or []
+    out = []
+    for a in audit_list:
+        dt = a.get("FECHA_AUDITORIA")
+        if isinstance(dt, str) and dt.startswith("/Date("):
+            try:
+                ms = int(dt[6:-2])
+                if ms >= cutoff_ms:
+                    out.append(a)
+            except Exception:
+                pass
+    return out
+

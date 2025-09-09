@@ -1,10 +1,13 @@
 # app.py
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, HttpUrl, Field
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Literal,NamedTuple
 import os,requests, urllib.parse, json, time, uuid, threading
-from audit_client import get_audit_for_id 
-from typing import Literal,NamedTuple
+from audit_client import (
+    make_session_for_operator, get_site,
+    get_audit_for_id,  
+    get_status_for_id, load_auditoria, filter_audit_since
+)
 import ssl
 from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
@@ -504,3 +507,151 @@ def audit_enqueue(body: AuditEnqueueIn):
     t.start()
     # immediate, small response so Apps Script never waits
     return AuditEnqueueOut(job_id=job_id, accepted=True)
+
+
+#------------------------ Update --------------------------------
+
+class StatusItem(BaseModel):
+    id: int
+    operator: Operator = "afinia"
+    last_status_text: Optional[str] = None     # what your Sheet currently has (e.g., "Pendiente documento")
+    last_status_code: Optional[int] = None     # optional, if you store numeric code too
+
+class StatusRefreshIn(BaseModel):
+    items: List[StatusItem]
+    webhook_url: HttpUrl
+    timeout_s: int = Field(30, ge=5)
+    max_retries: int = Field(2, ge=0)
+    delay_ms: int = Field(25, ge=0)
+    # Optional: only include auditoría entries on/after this many days back
+    days_back: Optional[int] = Field(None, ge=0, description="If set, only include audit entries in the last X days")
+
+class StatusRefreshSummary(BaseModel):
+    processed: int
+    changed: int
+    invalid: int
+    errors: int
+    duration_s: float
+
+@app.post("/status/refresh", response_model=StatusRefreshSummary)
+def status_refresh(body: StatusRefreshIn):
+    """
+    For each (id, operator, last_status_text/last_status_code), fetch current status.
+    If it changed, also fetch auditoría (optionally filtered by days_back) and POST a status_change event.
+    """
+    t0 = time.time()
+    processed = changed = invalid = errors = 0
+
+    # We can mix operators in one run; create a session cache per operator
+    sessions: Dict[str, requests.Session] = {}
+    cutoff_ms: Optional[int] = None
+    if body.days_back is not None:
+        cutoff_ms = int((time.time() - body.days_back * 86400) * 1000)
+
+    try:
+        # notify start
+        try:
+            requests.post(body.webhook_url, json={
+                "event": "status_refresh_started",
+                "count": len(body.items),
+                "days_back": body.days_back
+            }, timeout=10)
+        except Exception:
+            pass
+
+        for it in body.items:
+            processed += 1
+            try:
+                op = it.operator
+                sess = sessions.get(op)
+                if sess is None:
+                    sess = make_session_for_operator(op, insecure_verify=False)
+                    sessions[op] = sess
+
+                # 1) live status
+                live = get_status_for_id(
+                    it.id, operator=op,
+                    timeout_s=body.timeout_s, max_retries=body.max_retries,
+                    session=sess
+                )
+                if not live.get("valid"):
+                    invalid += 1
+                    continue
+
+                live_code = live.get("status_code")
+                live_text = (live.get("status_text") or "").strip() if live.get("status_text") else None
+                old_code = it.last_status_code
+                old_text = (it.last_status_text or "").strip() if it.last_status_text else None
+
+                # 2) did it change? (compare text if present; else compare code)
+                changed_now = False
+                if old_text is not None and live_text is not None:
+                    changed_now = (live_text != old_text)
+                elif old_code is not None and live_code is not None:
+                    changed_now = (str(live_code) != str(old_code))
+                else:
+                    # If we only have one side, treat as changed to be safe
+                    changed_now = True
+
+                if changed_now:
+                    changed += 1
+                    # 3) load auditoría for context
+                    form_url = live.get("referer_used")
+                    if not form_url:
+                        # prime page if needed
+                        # (get_status_for_id already primed; but keep safe)
+                        form_url = live.get("referer_used")
+
+                    audit = load_auditoria(sess, site=get_site(op), form_url=form_url, timeout_s=body.timeout_s, max_retries=body.max_retries)
+                    audit = filter_audit_since(audit, cutoff_ms)
+
+                    # 4) notify webhook about change
+                    try:
+                        requests.post(body.webhook_url, json={
+                            "event": "status_change",
+                            "id": it.id,
+                            "operator": op,
+                            "old_status_text": old_text,
+                            "old_status_code": old_code,
+                            "new_status_text": live_text,
+                            "new_status_code": live_code,
+                            "audit": audit or []
+                        }, timeout=15)
+                    except Exception:
+                        pass
+
+                # be gentle
+                if body.delay_ms:
+                    time.sleep(body.delay_ms / 1000.0)
+
+            except Exception as e:
+                errors += 1
+                try:
+                    requests.post(body.webhook_url, json={
+                        "event": "status_item_error",
+                        "id": it.id,
+                        "operator": it.operator,
+                        "error": str(e)
+                    }, timeout=10)
+                except Exception:
+                    pass
+
+    finally:
+        for s in sessions.values():
+            try: s.close()
+            except: pass
+        try:
+            requests.post(body.webhook_url, json={
+                "event": "status_refresh_finished",
+                "stats": {
+                    "processed": processed, "changed": changed, "invalid": invalid, "errors": errors,
+                    "duration_s": round(time.time() - t0, 3)
+                }
+            }, timeout=10)
+        except Exception:
+            pass
+
+    return StatusRefreshSummary(
+        processed=processed, changed=changed, invalid=invalid, errors=errors,
+        duration_s=round(time.time() - t0, 3)
+    )
