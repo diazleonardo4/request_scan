@@ -515,7 +515,8 @@ class StatusItem(BaseModel):
     id: int
     operator: Operator = "afinia"
     last_status_text: Optional[str] = None     # what your Sheet currently has (e.g., "Pendiente documento")
-    last_status_code: Optional[int] = None     # optional, if you store numeric code too
+    last_status_code: Optional[int] = None
+    sheet_row: Optional[int] = None    # optional, if you store numeric code too
 
 class StatusRefreshIn(BaseModel):
     items: List[StatusItem]
@@ -614,6 +615,7 @@ def status_refresh(body: StatusRefreshIn):
                             "old_status_code": old_code,
                             "new_status_text": live_text,
                             "new_status_code": live_code,
+                            "sheet_row": it.sheet_row,
                             "audit": audit or []
                         }, timeout=15)
                     except Exception:
