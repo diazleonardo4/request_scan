@@ -538,8 +538,7 @@ class StatusRefreshSummary(BaseModel):
     errors: int
     duration_s: float
 
-@app.post("/status/refresh", response_model=StatusRefreshSummary)
-def status_refresh(body: StatusRefreshIn):
+def _run_status_refresh(job_id: str, body: StatusRefreshIn):
     """
     For each (id, operator, last_status_text/last_status_code), fetch current status.
     If it changed, also fetch auditoría (optionally filtered by days_back) and POST a status_change event.
@@ -661,3 +660,14 @@ def status_refresh(body: StatusRefreshIn):
         processed=processed, changed=changed, invalid=invalid, errors=errors,
         duration_s=round(time.time() - t0, 3)
     )
+
+
+
+@app.post("/status/refresh")
+def status_refresh(body: StatusRefreshIn, bg: BackgroundTasks):
+    job_id = str(uuid.uuid4())
+    bg.add_task(_run_status_refresh, job_id, body)
+    return {
+        "job_id": job_id,
+        "status": "started"
+    }
