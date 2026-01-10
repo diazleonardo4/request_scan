@@ -436,6 +436,7 @@ def _run_audit_job(job_id: str, cfg: AuditEnqueueIn):
 
     try:
         for the_id in cfg.ids:
+            sess = make_session_for_operator(cfg.operator, False)
             try:
                 res = get_audit_for_id(
                     the_id,
@@ -475,6 +476,9 @@ def _run_audit_job(job_id: str, cfg: AuditEnqueueIn):
                         }, timeout=10)
                     except Exception:
                         pass
+            finally:
+                if sess is not None:
+                    sess.close()
 
             if cfg.delay_ms:
                 time.sleep(cfg.delay_ms / 1000.0)
