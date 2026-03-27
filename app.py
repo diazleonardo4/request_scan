@@ -668,3 +668,64 @@ def status_refresh(body: StatusRefreshIn, bg: BackgroundTasks):
         "job_id": job_id,
         "status": "started"
     }
+
+
+# ===================== /fetch/batch =====================
+
+class FetchBatchIn(BaseModel):
+    ids: List[int]
+    operator: Operator = "afinia"
+    webhook_url: HttpUrl
+    timeout_s: int = Field(30, ge=5)
+    max_retries: int = Field(2, ge=0)
+    delay_ms: int = Field(50, ge=0)
+
+
+def _run_fetch_batch(job_id: str, cfg: FetchBatchIn):
+    """Re-fetch CargarDatosSolicitud for a list of known IDs.
+    Emits item events with the same payload structure as /scan/range."""
+    site = get_site(cfg.operator)
+    s = make_session_for_operator(cfg.operator, False)  # shared for validate_only (stateless)
+    processed = found = skipped = errors = 0
+
+    _notify(str(cfg.webhook_url), "scan_started", {
+        "job_id": job_id, "count": len(cfg.ids), "operator": cfg.operator
+    })
+    try:
+        for the_id in cfg.ids:
+            id_str = str(the_id)
+            try:
+                vres = validate_only(s, site=site, id_solicitud=id_str,
+                                     timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                processed += 1
+                if vres["valid"]:
+                    with make_session_for_operator(cfg.operator, False) as _s:
+                        full = load_valid_id_full(_s, site=site, id_solicitud=id_str,
+                                                  timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                    _notify(str(cfg.webhook_url), "item", {
+                        "job_id": job_id, "id": id_str,
+                        "valid": True, "operator": cfg.operator, **full
+                    })
+                    found += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                errors += 1
+                _notify(str(cfg.webhook_url), "item_error", {
+                    "job_id": job_id, "id": id_str, "error": str(e)
+                })
+            if cfg.delay_ms:
+                time.sleep(cfg.delay_ms / 1000.0)
+    finally:
+        s.close()
+        _notify(str(cfg.webhook_url), "scan_finished", {
+            "job_id": job_id,
+            "stats": {"processed": processed, "found": found, "skipped": skipped, "errors": errors}
+        })
+
+
+@app.post("/fetch/batch")
+def fetch_batch(body: FetchBatchIn, bg: BackgroundTasks):
+    job_id = str(uuid.uuid4())
+    bg.add_task(_run_fetch_batch, job_id, body)
+    return {"job_id": job_id, "status": "started"}
