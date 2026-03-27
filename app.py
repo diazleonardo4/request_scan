@@ -198,9 +198,8 @@ def validate_only(s: requests.Session, *, site: Site, id_solicitud: str, timeout
 # ---------- full load for valid IDs ----------
 def load_valid_id_full(s: requests.Session, *,site: Site, id_solicitud: str,
                        timeout_s: int, max_retries: int) -> Dict[str, Any]:
-    
 
-    headers = {
+    base_headers = {
         "User-Agent": site.ua,
         "Origin": site.base,
         "X-Requested-With": "XMLHttpRequest",
@@ -209,14 +208,11 @@ def load_valid_id_full(s: requests.Session, *,site: Site, id_solicitud: str,
         "Referer": site.home_referer,
     }
 
-
-    # We already did ValidaSolicitud in the caller, but doing it again is cheap; skip here.
-
     # Encrypt
     r2 = _post_json_with_retries(
         s, f"{site.base}{site.consulta_page}/Encryptar",
         json_body={"strParameter": f"ID_SOLICITUD={id_solicitud}"},
-        headers=headers,
+        headers=base_headers,
         timeout=timeout_s,
         retries=max_retries,
     )
@@ -233,11 +229,12 @@ def load_valid_id_full(s: requests.Session, *,site: Site, id_solicitud: str,
         timeout=timeout_s, retries=max_retries
     )
 
-    # Page method: CargarDatosSolicitud (force zero-length body)
-    url_cargar = f"{site.base}{site.form_page}/CargarDatosSolicitud"
+    # Page method: CargarDatosSolicitud — Referer must match the primed form URL
+    # (consistent with cargar_datos_solicitud in audit_client.py)
+    url_cargar = form_url.rsplit("?", 1)[0] + "/CargarDatosSolicitud"
     r4 = s.post(
         url_cargar,
-        headers=headers,
+        headers={**base_headers, "Referer": form_url},
         timeout=timeout_s,
         data=b"",  # Content-Length: 0
     )
