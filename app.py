@@ -267,8 +267,11 @@ def run_scan(job_id: str, cfg: ScanIn):
                                          timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                     if vres["valid"] and cfg.fetch_data_for_valid:
                         with make_session_for_operator(cfg.operator, False) as _s:
-                            full = load_valid_id_full(_s, site=site,id_solicitud=id_str,
-                                                      timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                            v2 = validate_only(_s, site=site, id_solicitud=id_str,
+                                               timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                            full = load_valid_id_full(_s, site=site, id_solicitud=id_str,
+                                                      timeout_s=cfg.timeout_s, max_retries=cfg.max_retries) \
+                                   if v2["valid"] else {"warning": "re-validate on fresh session returned false"}
                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
                                                           "valid": True, "operator":cfg.operator, **full})
                         found += 1
@@ -310,8 +313,11 @@ def run_scan(job_id: str, cfg: ScanIn):
                             if j == i:
                                 if cfg.fetch_data_for_valid:
                                     with make_session_for_operator(cfg.operator, False) as _s:
-                                        full = load_valid_id_full(_s, site=site,id_solicitud=jid,
-                                                                  timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                                        v2 = validate_only(_s, site=site, id_solicitud=jid,
+                                                           timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                                        full = load_valid_id_full(_s, site=site, id_solicitud=jid,
+                                                                  timeout_s=cfg.timeout_s, max_retries=cfg.max_retries) \
+                                               if v2["valid"] else {"warning": "re-validate on fresh session returned false"}
                                     _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
                                                                       "valid": True,"operator":cfg.operator, **full})
                                 else:
@@ -325,8 +331,11 @@ def run_scan(job_id: str, cfg: ScanIn):
                                 if vnext["valid"]:
                                     if cfg.fetch_data_for_valid:
                                         with make_session_for_operator(cfg.operator, False) as _s:
-                                            full = load_valid_id_full(_s, site=site,id_solicitud=jid,
-                                                                      timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                                            v2 = validate_only(_s, site=site, id_solicitud=jid,
+                                                               timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                                            full = load_valid_id_full(_s, site=site, id_solicitud=jid,
+                                                                      timeout_s=cfg.timeout_s, max_retries=cfg.max_retries) \
+                                                   if v2["valid"] else {"warning": "re-validate on fresh session returned false"}
                                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
                                                                           "valid": True,"operator":cfg.operator, **full})
                                     else:
