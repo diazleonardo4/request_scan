@@ -269,8 +269,9 @@ def run_scan(job_id: str, cfg: ScanIn):
                     vres = validate_only(s, site=site,id_solicitud=id_str,
                                          timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                     if vres["valid"] and cfg.fetch_data_for_valid:
-                        full = load_valid_id_full(s, site=site,id_solicitud=id_str,
-                                                  timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                        with make_session_for_operator(cfg.operator, False) as _s:
+                            full = load_valid_id_full(_s, site=site,id_solicitud=id_str,
+                                                      timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": id_str,
                                                           "valid": True, "operator":cfg.operator, **full})
                         found += 1
@@ -311,8 +312,9 @@ def run_scan(job_id: str, cfg: ScanIn):
                             # For the first one we already validated; fetch data if requested
                             if j == i:
                                 if cfg.fetch_data_for_valid:
-                                    full = load_valid_id_full(s, site=site,id_solicitud=jid,
-                                                              timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                                    with make_session_for_operator(cfg.operator, False) as _s:
+                                        full = load_valid_id_full(_s, site=site,id_solicitud=jid,
+                                                                  timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                                     _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
                                                                       "valid": True,"operator":cfg.operator, **full})
                                 else:
@@ -325,8 +327,9 @@ def run_scan(job_id: str, cfg: ScanIn):
                                 processed += 1
                                 if vnext["valid"]:
                                     if cfg.fetch_data_for_valid:
-                                        full = load_valid_id_full(s, site=site,id_solicitud=jid,
-                                                                  timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                                        with make_session_for_operator(cfg.operator, False) as _s:
+                                            full = load_valid_id_full(_s, site=site,id_solicitud=jid,
+                                                                      timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
                                         _notify(cfg.webhook_url, "item", {"job_id": job_id, "id": jid,
                                                                           "valid": True,"operator":cfg.operator, **full})
                                     else:
@@ -546,8 +549,6 @@ def _run_status_refresh(job_id: str, body: StatusRefreshIn):
     t0 = time.time()
     processed = changed = invalid = errors = 0
 
-    # We can mix operators in one run; create a session cache per operator
-    sessions: Dict[str, requests.Session] = {}
     cutoff_ms: Optional[int] = None
     if body.days_back is not None:
         cutoff_ms = int((time.time() - body.days_back * 86400) * 1000)
@@ -565,12 +566,9 @@ def _run_status_refresh(job_id: str, body: StatusRefreshIn):
 
         for it in body.items:
             processed += 1
+            sess = make_session_for_operator(it.operator, insecure_verify=False)
             try:
                 op = it.operator
-                sess = sessions.get(op)
-                if sess is None:
-                    sess = make_session_for_operator(op, insecure_verify=False)
-                    sessions[op] = sess
 
                 # 1) live status
                 live = get_status_for_id(
@@ -639,11 +637,10 @@ def _run_status_refresh(job_id: str, body: StatusRefreshIn):
                     }, timeout=10)
                 except Exception:
                     pass
+            finally:
+                sess.close()
 
     finally:
-        for s in sessions.values():
-            try: s.close()
-            except: pass
         try:
             requests.post(body.webhook_url, json={
                 "event": "status_refresh_finished",
