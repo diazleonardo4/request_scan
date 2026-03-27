@@ -680,9 +680,10 @@ class FetchBatchIn(BaseModel):
 
 def _run_fetch_batch(job_id: str, cfg: FetchBatchIn):
     """Re-fetch CargarDatosSolicitud for a list of known IDs.
-    Emits item events with the same payload structure as /scan/range."""
+    Emits item events with the same payload structure as /scan/range.
+    Uses one fresh session per ID for the full validate→encrypt→prime→load
+    sequence to prevent any cross-ID session contamination."""
     site = get_site(cfg.operator)
-    s = make_session_for_operator(cfg.operator, False)  # shared for validate_only (stateless)
     processed = found = skipped = errors = 0
 
     _notify(str(cfg.webhook_url), "scan_started", {
@@ -692,20 +693,23 @@ def _run_fetch_batch(job_id: str, cfg: FetchBatchIn):
         for the_id in cfg.ids:
             id_str = str(the_id)
             try:
-                vres = validate_only(s, site=site, id_solicitud=id_str,
-                                     timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
-                processed += 1
-                if vres["valid"]:
-                    with make_session_for_operator(cfg.operator, False) as _s:
-                        full = load_valid_id_full(_s, site=site, id_solicitud=id_str,
+                # One fresh session per ID — validate and load share the same session
+                # so the server never sees a split between the validation state and
+                # the form-prime state. Avoids cross-request contamination entirely.
+                with make_session_for_operator(cfg.operator, False) as sess:
+                    vres = validate_only(sess, site=site, id_solicitud=id_str,
+                                         timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
+                    processed += 1
+                    if vres["valid"]:
+                        full = load_valid_id_full(sess, site=site, id_solicitud=id_str,
                                                   timeout_s=cfg.timeout_s, max_retries=cfg.max_retries)
-                    _notify(str(cfg.webhook_url), "item", {
-                        "job_id": job_id, "id": id_str,
-                        "valid": True, "operator": cfg.operator, **full
-                    })
-                    found += 1
-                else:
-                    skipped += 1
+                        _notify(str(cfg.webhook_url), "item", {
+                            "job_id": job_id, "id": id_str,
+                            "valid": True, "operator": cfg.operator, **full
+                        })
+                        found += 1
+                    else:
+                        skipped += 1
             except Exception as e:
                 errors += 1
                 _notify(str(cfg.webhook_url), "item_error", {
@@ -714,7 +718,6 @@ def _run_fetch_batch(job_id: str, cfg: FetchBatchIn):
             if cfg.delay_ms:
                 time.sleep(cfg.delay_ms / 1000.0)
     finally:
-        s.close()
         _notify(str(cfg.webhook_url), "scan_finished", {
             "job_id": job_id,
             "stats": {"processed": processed, "found": found, "skipped": skipped, "errors": errors}
