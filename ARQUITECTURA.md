@@ -6,6 +6,11 @@ El Servicio Request Scan es una API web que automatiza la obtención de datos de
 
 Todos los trabajos se ejecutan en segundo plano. El servicio responde de inmediato con un `job_id` y luego envía los resultados de forma incremental a una **URL de webhook** que usted provee (en este caso, una aplicación web de Google Apps Script que escribe en Google Sheets).
 
+| | |
+|---|---|
+| **Repositorio** | https://github.com/tecnologia-andes-energy/request_scan |
+| **Servidor (Render)** | https://dashboard.render.com/web/srv-d73c6lmuk2gs73ef0jp0 |
+
 ---
 
 ## Los Cuatro Endpoints
@@ -311,4 +316,8 @@ Transformador A → Solicitud 1001 → Auditoría: [Estado X, Estado Y]  →  2 
 
 ## Restricción de Alojamiento (Render Plan Gratuito)
 
-El servicio está alojado en el plan gratuito de Render, que apaga el servidor tras **15 minutos de inactividad**. Cualquier trabajo en segundo plano en curso se cancela cuando esto ocurre. Para evitarlo durante trabajos de larga duración, una función de mantenimiento debe hacer ping a `GET /health` cada 10 minutos. Esto se realiza mediante un disparador programado por tiempo en Google Apps Script.
+El servicio está alojado en el plan gratuito de Render en la siguiente URL:
+
+> https://dashboard.render.com/web/srv-d73c6lmuk2gs73ef0jp0
+
+El plan gratuito apaga el servidor tras **15 minutos de inactividad**. Cualquier trabajo en segundo plano en curso se cancela cuando esto ocurre. Para evitarlo durante trabajos de larga duración, una función de mantenimiento debe hacer ping a `GET /health` cada 10 minutos. Esto se realiza mediante un disparador programado por tiempo en Google Apps Script.
