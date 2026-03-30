@@ -213,6 +213,91 @@ Para máximo rendimiento, se recomienda siempre proveer `sheet_row` en las solic
 
 ---
 
+## Reporte en Looker Studio
+
+El reporte de Looker Studio es la interfaz visual principal para explorar y filtrar todas las solicitudes capturadas por el servicio. Combina un mapa geográfico, una tabla de solicitudes y una tabla de auditoría, todos sincronizados con los mismos filtros.
+
+> **Nota:** Al pie del reporte se muestra la **fecha de la última actualización**, que corresponde al momento en que los datos fueron refrescados desde Google Sheets.
+
+---
+
+### Filtros disponibles
+
+#### Filtros generales
+
+| Filtro | Tipo | Descripción |
+|---|---|---|
+| **Selecciona un periodo** | Selector de fechas | Filtra solicitudes por rango de `FEC_CREA` |
+| **DESC_ESTADO** | Lista desplegable | Filtra por estado actual de la solicitud (ej. `De Baja`, `Solicitado`, `Aprobado`) |
+| **EMAIL_CLI** | Lista desplegable | Filtra por correo electrónico del cliente |
+| **TIPO** | Lista desplegable | Filtra por tipo de solicitud |
+| **id** | Campo de texto | Busca una solicitud por su ID exacto |
+| **TENSION_ENTREGADA** | Deslizador numérico | Filtra por rango de tensión entregada (kV) |
+
+#### Filtro de distancia geográfica
+
+Este filtro permite encontrar todas las solicitudes dentro de un radio en kilómetros alrededor de un punto en el mapa.
+
+| Campo | Descripción |
+|---|---|
+| **lat** | Latitud del punto central, usando **coma** como separador decimal (ej. `8,751`) |
+| **long** | Longitud del punto central, usando **coma** como separador decimal (ej. `-75,87`) |
+| **distancia** | Radio de búsqueda en kilómetros (ej. `50`) |
+| **dentro_de_radio** | Seleccionar `1` para mostrar **solo** las solicitudes dentro del radio · Seleccionar `0` o vacío para mostrar todas |
+
+**Pasos para usar el filtro de distancia:**
+1. Ingresar la latitud con coma decimal en el campo **lat**
+2. Ingresar la longitud con coma decimal en el campo **long**
+3. Ingresar la distancia en kilómetros en el campo **distancia**
+4. Seleccionar `1` en el filtro **dentro_de_radio**
+
+---
+
+### Secciones del reporte
+
+#### Mapa
+Muestra la ubicación geográfica de cada solicitud usando sus campos `LATITUD` y `LONGITUD`. Los puntos se actualizan en tiempo real al aplicar cualquier filtro. Permite identificar visualmente concentraciones de solicitudes por zona.
+
+#### Tabla de solicitudes
+Lista paginada (100 registros por página) con las columnas principales de cada solicitud:
+
+| Columna | Descripción |
+|---|---|
+| `id` | Identificador único de la solicitud |
+| `FEC_CREA` | Fecha y hora de creación |
+| `DESC_ESTADO` | Estado actual |
+| `EMAIL_CLI` | Correo del cliente |
+| `DESC_CIU...` | Ciudad (DESC_CIUDAD_PRO) |
+
+El contador superior derecho muestra el **total de registros** que coinciden con los filtros activos (ej. `1 - 100 / 17.610`).
+
+#### Tabla de auditoría
+Lista paginada con el historial de eventos de cada solicitud:
+
+| Columna | Descripción |
+|---|---|
+| `id` | ID de la solicitud a la que pertenece la entrada |
+| `FEC_CREA` | Fecha de creación de la solicitud |
+| `FECHA_AUDITORIA` | Fecha en que ocurrió el evento de auditoría |
+| `ESTADO_AUDITORIA` | Estado registrado en ese momento |
+| `OBSERVACION_AUDITORIA` | Observación o detalle del evento |
+
+Esta tabla puede tener **más filas que la tabla de solicitudes** porque cada solicitud puede tener múltiples eventos de auditoría a lo largo del tiempo.
+
+---
+
+### Combinaciones de filtros frecuentes
+
+| Objetivo | Filtros a usar |
+|---|---|
+| Ver todas las solicitudes activas en una zona | `DESC_ESTADO` + `lat` / `long` / `distancia` / `dentro_de_radio = 1` |
+| Buscar el historial de una solicitud específica | `id` (campo de texto) |
+| Ver solicitudes creadas en un período | `Selecciona un periodo` |
+| Ver solicitudes de alta tensión pendientes | `TENSION_ENTREGADA` (deslizador) + `DESC_ESTADO` |
+| Filtrar por cliente | `EMAIL_CLI` |
+
+---
+
 ## Herramienta de Consulta por Transformador — Google Apps Script
 
 Esta herramienta es un script de Google Apps Script independiente del servicio de escaneo. Su propósito es responder la pregunta: **¿qué solicitudes de generación solar están asociadas a una lista de transformadores?**
