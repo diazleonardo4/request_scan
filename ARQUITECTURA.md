@@ -136,6 +136,78 @@ Los valores del campo `data` pasan por una función de conversión antes de escr
 
 ---
 
+## Webhook Receptor — Google Apps Script (`/status/refresh`)
+
+Este webhook recibe los eventos del endpoint `/status/refresh` y realiza dos acciones simultáneas sobre la hoja de cálculo: **actualiza el estado** en la hoja principal de solicitudes y **registra el historial de auditoría** en una hoja separada de solo adición.
+
+### Hojas involucradas
+
+| Hoja | Propósito |
+|---|---|
+| `RAW` | Hoja principal de solicitudes. Se actualiza cuando cambia el estado de un ID. |
+| `AUDIT` | Registro histórico de auditoría. Solo se agregan filas, nunca se modifican. |
+
+### Eventos procesados
+
+A diferencia del webhook de `/scan/range`, este webhook **solo procesa el evento `status_change`**. Todos los demás eventos (`status_refresh_started`, `status_refresh_finished`, `status_item_error`, etc.) son ignorados y retornan `"IGNORED"`.
+
+Un evento `status_change` llega cuando el servicio detecta que el estado actual de un ID en el portal es diferente al último estado conocido.
+
+### Flujo de procesamiento ante un `status_change`
+
+```
+1. Se extrae del evento: id, new_status_text, new_status_code, sheet_row, audit[]
+
+2. Actualización en hoja RAW:
+   a. Si se proveyó sheet_row válido → escribe directamente en esa fila (O(1))
+   b. Si no → busca la fila recorriendo la columna de IDs y actualiza la primera coincidencia
+   En ambos casos se escribe: nuevo estado en columna 11, fecha de actualización en columna 105
+
+3. Registro de auditoría en hoja AUDIT:
+   a. Para cada entrada del arreglo audit[] recibido en el evento:
+      → Calcula una clave de deduplicación: "{id}|{estado_normalizado}"
+      → Si la clave ya existe en la hoja AUDIT, la entrada se omite
+      → Si es nueva, se agrega como fila al final de la hoja
+   b. Todas las filas nuevas se escriben en un solo batch para eficiencia
+```
+
+### Estructura de la hoja AUDIT
+
+| Columna | Campo | Descripción |
+|---|---|---|
+| `ts` | Marca de tiempo | Momento en que llegó el evento al webhook |
+| `id` | ID solicitud | ID de la solicitud |
+| `USUARIO` | Usuario | Usuario que realizó la acción en el portal |
+| `ID_ACCION` | Código de acción | Código numérico de la acción registrada |
+| `FECHA_AUDITORIA` | Fecha | Fecha de la acción (convertida desde formato .NET) |
+| `ESTADO_AUDITORIA` | Estado | Estado registrado en esa entrada de auditoría |
+| `OBSERVACION_AUDITORIA` | Observación | Texto de observación de la acción |
+| `DETALLE_AUDITORIA` | Detalle | Detalle adicional de la acción |
+| `raw_json` | JSON completo | Objeto completo de la entrada serializado como JSON |
+| `dedupe_key` | Clave de deduplicación | `"{id}\|{estado}"` — siempre la última columna |
+
+### Deduplicación
+
+Para evitar registrar la misma entrada de auditoría múltiples veces (por ejemplo, si `/status/refresh` se ejecuta varias veces sobre el mismo ID), cada fila de auditoría tiene una `dedupe_key` con el formato:
+
+```
+{id}|{estado_normalizado_en_minúsculas}
+```
+
+Antes de insertar cualquier fila, el webhook carga toda la columna `dedupe_key` en memoria y descarta las entradas cuya clave ya exista. Las filas nuevas se escriben en un único `setValues` al final.
+
+### Estrategia de actualización en RAW (O(1) vs búsqueda)
+
+El servicio puede enviar opcionalmente el campo `sheet_row` en el evento, indicando exactamente en qué fila de la hoja `RAW` está ese ID. Cuando está presente:
+- Se escribe directamente en esa fila → **una sola operación de escritura**.
+
+Cuando no está presente o es inválido:
+- Se lee toda la columna de IDs de `RAW` y se busca la primera fila que coincida → **más lento**, proporcional al número de registros.
+
+Para máximo rendimiento, se recomienda siempre proveer `sheet_row` en las solicitudes a `/status/refresh`.
+
+---
+
 ## Restricción de Alojamiento (Render Plan Gratuito)
 
 El servicio está alojado en el plan gratuito de Render, que apaga el servidor tras **15 minutos de inactividad**. Cualquier trabajo en segundo plano en curso se cancela cuando esto ocurre. Para evitarlo durante trabajos de larga duración, una función de mantenimiento debe hacer ping a `GET /health` cada 10 minutos. Esto se realiza mediante un disparador programado por tiempo en Google Apps Script.
