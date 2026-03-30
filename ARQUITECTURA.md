@@ -208,6 +208,107 @@ Para máximo rendimiento, se recomienda siempre proveer `sheet_row` en las solic
 
 ---
 
+## Herramienta de Consulta por Transformador — Google Apps Script
+
+Esta herramienta es un script de Google Apps Script independiente del servicio de escaneo. Su propósito es responder la pregunta: **¿qué solicitudes de generación solar están asociadas a una lista de transformadores?**
+
+El usuario sube una lista de códigos de transformador y el script cruza esa lista contra las bases de datos maestras de ambos operadores (Afinia y Air-e), enriquece los resultados con el historial de auditoría y aplica lógica de vencimiento, todo dentro de la misma hoja de cálculo.
+
+### Hojas involucradas
+
+| Hoja | Tipo | Propósito |
+|---|---|---|
+| `UPLOAD` | Entrada | El usuario pega aquí la lista de códigos de transformador (`COD_TRAFO_PRO`), uno por fila |
+| `RESULT` | Salida | El script escribe aquí el resultado del cruce. Se sobreescribe completamente en cada ejecución |
+
+### Fuentes de datos maestras
+
+El script consulta cuatro hojas externas en dos libros de cálculo separados:
+
+| Fuente | Hoja | Operador | Contenido |
+|---|---|---|---|
+| MASTER 1 | `RAW` | Afinia | Datos principales de solicitudes |
+| MASTER 1 | `AUDIT` | Afinia | Historial de auditoría |
+| MASTER 2 | `RAW` | Air-e | Datos principales de solicitudes |
+| MASTER 2 | `AUDIT` | Air-e | Historial de auditoría |
+
+Estas hojas son alimentadas por los webhooks del servicio de escaneo descritos en las secciones anteriores.
+
+### Cómo ejecutar
+
+1. Pegar los códigos de transformador en la hoja `UPLOAD` (una columna, una por fila, sin encabezado o con cualquier encabezado — el script lo reemplaza automáticamente)
+2. Ir al menú **📂 Carga → Procesar archivo + Unir con MASTER**
+3. Ingresar la **fecha de corte** en formato `YYYY-MM-DD` cuando el script la solicite
+4. El resultado aparece en la hoja `RESULT`
+
+### Flujo de procesamiento
+
+```
+1. NORMALIZACIÓN DE UPLOAD
+   → Se conserva solo la primera columna
+   → El encabezado se fuerza a "COD_TRAFO_PRO"
+
+2. CARGA DE DATOS MAESTROS
+   → Se leen las hojas RAW de MASTER 1 y MASTER 2
+   → Solo se cargan en memoria las filas cuyo COD_TRAFO_PRO
+     aparece en la lista UPLOAD (filtro temprano para eficiencia)
+   → Se leen las hojas AUDIT de MASTER 1 y MASTER 2
+     (todas las entradas de auditoría, indexadas por id)
+
+3. CRUCE (INNER JOIN)
+   → Por cada código de transformador en UPLOAD:
+     se buscan todas las solicitudes en los datos maestros
+     que tengan ese mismo COD_TRAFO_PRO
+   → Solo se incluyen solicitudes que aparezcan en UPLOAD
+     (inner join: si no hay coincidencia, la fila se descarta)
+
+4. FILTRO POR FECHA DE CORTE
+   → Se eliminan filas cuya FEC_CREA sea posterior a la fecha
+     de corte ingresada por el usuario
+
+5. LÓGICA DE VENCIMIENTO
+   → Solo para solicitudes en estado:
+     "Pendiente documento", "Revisión documento" o "Solicitado"
+   → Se calcula: fecha_ultimo_estado + 4 meses = calculated_date
+   → Si calculated_date ≤ hoy → expired_flag = "EXPIRED"
+   → Si calculated_date > hoy o el estado no aplica → expired_flag vacío
+
+6. EXPANSIÓN POR AUDITORÍA
+   → Por cada solicitud resultado del cruce:
+     si tiene entradas en AUDIT → se genera una fila por cada entrada
+     si no tiene auditoría → se genera una sola fila con las columnas de auditoría vacías
+   → Esto significa que una misma solicitud puede aparecer
+     múltiples veces en RESULT, una por cada evento de auditoría
+
+7. ESCRITURA EN RESULT
+   → Se borra completamente la hoja RESULT
+   → Se escribe el resultado en un único setValues (un solo API call)
+```
+
+### Columnas del resultado (`RESULT`)
+
+La hoja `RESULT` combina columnas de tres fuentes en este orden:
+
+| Grupo | Columnas | Origen |
+|---|---|---|
+| Identificador del transformador | `COD_TRAFO_PRO` | Hoja UPLOAD |
+| Datos de la solicitud | `id`, `FEC_CREA`, `COD_TRAFO_PRO`, `NOMBRE_CLI`, `EMAIL_CLI`, `DESC_ESTADO`, `TIPO`, `LONGITUD`, `LATITUD`, `DESC_CIUDAD_PRO`, `DESC_CORREGIMIENTO_PRO`, `DIRRECION_PRO`, `POTENCIA_ENTREGADA`, `TENSION_ENTREGADA`, `fecha_ultimo_estado` | MASTER RAW |
+| Historial de auditoría | `FECHA_AUDITORIA`, `ESTADO_AUDITORIA`, `OBSERVACION_AUDITORIA` | MASTER AUDIT |
+| Calculadas | `calculated_date`, `expired_flag` | Lógica del script |
+
+### Comportamiento ante múltiples registros por transformador
+
+Un mismo código de transformador puede tener **varias solicitudes** asociadas, y cada solicitud puede tener **varios eventos de auditoría**. El resultado se expande en todas las combinaciones posibles:
+
+```
+Transformador A → Solicitud 1001 → Auditoría: [Estado X, Estado Y]  →  2 filas
+                → Solicitud 1002 → Sin auditoría                    →  1 fila
+                                                                    ─────────
+                                                          Total:     3 filas
+```
+
+---
+
 ## Restricción de Alojamiento (Render Plan Gratuito)
 
 El servicio está alojado en el plan gratuito de Render, que apaga el servidor tras **15 minutos de inactividad**. Cualquier trabajo en segundo plano en curso se cancela cuando esto ocurre. Para evitarlo durante trabajos de larga duración, una función de mantenimiento debe hacer ping a `GET /health` cada 10 minutos. Esto se realiza mediante un disparador programado por tiempo en Google Apps Script.
