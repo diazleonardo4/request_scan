@@ -1,11 +1,5 @@
 # Cómo Funciona el Servicio Request Scan
 
-## Descripción General
-
-El Servicio Request Scan es una API web que automatiza la obtención de datos de solicitudes de generación solar desde los portales de las empresas de servicios públicos colombianas **Afinia** (`servicios.energiacaribemar.co`) y **Air-e** (`servicios.air-e.com`). Dado que estos portales son aplicaciones web estándar no diseñadas para acceso programático, el servicio simula una sesión de navegador para navegar por sus formularios y extraer la información.
-
-Todos los trabajos se ejecutan en segundo plano. El servicio responde de inmediato con un `job_id` y luego envía los resultados de forma incremental a una **URL de webhook** que usted provee (en este caso, una aplicación web de Google Apps Script que escribe en Google Sheets).
-
 | | |
 |---|---|
 | **Repositorio** | https://github.com/tecnologia-andes-energy/request_scan |
@@ -13,213 +7,293 @@ Todos los trabajos se ejecutan en segundo plano. El servicio responde de inmedia
 
 ---
 
-## Los Cuatro Endpoints
+## Descripción General
 
-| Endpoint | Propósito | Caso de uso |
+El Servicio Request Scan automatiza la obtención de datos de solicitudes de generación solar desde los portales de las empresas de servicios públicos colombianas **Afinia** (`servicios.energiacaribemar.co`) y **Air-e** (`servicios.air-e.com`). Dado que estos portales son aplicaciones web estándar no diseñadas para acceso programático, el servicio simula una sesión de navegador para extraer la información.
+
+El sistema tiene **cuatro componentes** que trabajan en cadena:
+
+```
+[1. Disparadores GAS] ──► [2. Servicio Request Scan] ──► [3. Google Sheets] ──► [4. Looker Studio]
+```
+
+---
+
+## Flujo General del Sistema
+
+El sistema opera con dos flujos diarios independientes: uno para **descubrir solicitudes nuevas** y otro para **monitorear el estado de las existentes**.
+
+### Flujo 1 — Descubrimiento de nuevas solicitudes (`/scan/range`)
+
+```
+┌─────────────────────────────────┐
+│  GAS: executeRequestScan()      │  Trigger diario (ej. 8am)
+│  Lee última fila de RAW         │
+│  start = último id + 1          │
+│  end   = start + 1000           │
+└────────────┬────────────────────┘
+             │ POST /scan/range
+             ▼
+┌─────────────────────────────────┐
+│  Servicio Request Scan          │  Responde 202 inmediatamente
+│  Prueba IDs start → end         │  Trabaja en segundo plano
+│  Por cada ID válido encontrado: │
+│    → Simula sesión ASP.NET      │
+│    → Extrae datos del formulario│
+└────────────┬────────────────────┘
+             │ POST webhook (evento "item" por cada ID válido)
+             ▼
+┌─────────────────────────────────┐
+│  GAS: doPost() — Webhook        │
+│  Por cada evento "item":        │
+│    → Agrega fila nueva en RAW   │
+└────────────┬────────────────────┘
+             │ Datos en Google Sheets
+             ▼
+┌─────────────────────────────────┐
+│  Looker Studio                  │
+│  Lee RAW y AUDIT directamente   │
+│  El reporte se actualiza solo   │
+└─────────────────────────────────┘
+```
+
+### Flujo 2 — Monitoreo de estado de solicitudes activas (`/status/refresh`)
+
+```
+┌─────────────────────────────────┐
+│  GAS: runStatusRefresh()        │  Trigger diario (ej. 9am)
+│  Lee todas las filas de RAW     │
+│  Filtra: solo últimos 365 días  │
+│  Excluye: Normalizado,          │
+│           Fuera de plazo,       │
+│           De Baja               │
+│  Resultado: lista de IDs activos│
+└────────────┬────────────────────┘
+             │ POST /status/refresh  (con todos los IDs activos)
+             ▼
+┌─────────────────────────────────┐
+│  Servicio Request Scan          │  Responde 202 inmediatamente
+│  Por cada ID en la lista:       │  Trabaja en segundo plano
+│    → Consulta estado actual     │
+│    → Compara con last_status    │
+│    → Si cambió: emite evento    │
+└────────────┬────────────────────┘
+             │ POST webhook (evento "status_change" solo si hubo cambio)
+             ▼
+┌─────────────────────────────────┐
+│  GAS: doPost() — Webhook        │
+│  Por cada "status_change":      │
+│    → Actualiza estado en RAW    │      ← fila existente, col. 11
+│    → Agrega entrada en AUDIT    │      ← fila nueva, solo adición
+└────────────┬────────────────────┘
+             │ Datos actualizados en Google Sheets
+             ▼
+┌─────────────────────────────────┐
+│  Looker Studio                  │
+│  Refleja los nuevos estados     │
+│  y el historial de auditoría    │
+└─────────────────────────────────┘
+```
+
+---
+
+## Componente 1 — Disparadores en Google Apps Script
+
+Los disparadores son funciones de Google Apps Script programadas con **time-based triggers** (ejecución automática en un horario fijo). Son el punto de entrada de todo el sistema.
+
+### `executeRequestScan()` — Descubrir IDs nuevos
+
+Calcula automáticamente el rango a escanear sin intervención manual:
+
+```
+1. Abre la hoja RAW de la hoja de cálculo maestra
+2. Lee el valor de la columna "id" en la ÚLTIMA fila con datos → ej. 19500
+3. start = 19500 + 1 = 19501
+4. end   = 19501 + 1000 = 20501
+5. Llama a request_scansAPI(19501, 20501)
+```
+
+La lógica es acumulativa: cada día el escaneo arranca exactamente donde terminó el anterior, avanzando siempre hacia adelante en el rango de IDs.
+
+**Parámetros enviados al servicio:**
+
+| Parámetro | Valor | Significado |
 |---|---|---|
-| `POST /scan/range` | Escanea un rango numérico de IDs para descubrir cuáles existen | Descubrimiento diario de nuevas solicitudes |
-| `POST /audit/batch` | Obtiene el historial de auditoría para una lista de IDs conocidos | Recuperar el historial de registros existentes |
-| `POST /status/refresh` | Verifica cambios de estado en IDs monitoreados | Seguimiento diario de solicitudes activas |
-| `POST /fetch/batch` | Re-obtiene los datos completos del formulario para una lista de IDs conocidos | Corrección de registros tras problemas de datos |
+| `start_id` / `end_id` | calculado | Rango a explorar |
+| `strategy` | `"linear"` | Prueba cada ID uno por uno |
+| `fetch_data_for_valid` | `true` | Si el ID existe, trae todos sus datos |
+| `delay_ms` | `20` | 20 ms de pausa entre IDs |
 
-También existe un endpoint `GET /health` disponible para pings de mantenimiento de conexión.
+### `runStatusRefresh()` — Monitorear solicitudes activas
+
+Lee todas las filas de RAW y aplica dos filtros antes de enviar al servicio:
+
+```
+Filtro 1 — Por fecha de creación:
+  Solo filas cuya FEC_CREA >= hoy - 365 días
+  (descarta solicitudes muy antiguas)
+
+Filtro 2 — Por estado actual:
+  Excluye: "Normalizado", "Fuera de plazo", "De Baja"
+  (descarta solicitudes ya resueltas o canceladas)
+```
+
+Por cada fila que pasa los filtros, construye un objeto:
+
+```json
+{
+  "id": 19350,
+  "operator": "afinia",
+  "last_status_text": "Solicitado",
+  "sheet_row": 847
+}
+```
+
+El campo `sheet_row` le dice al servicio exactamente en qué fila de RAW vive ese ID, para que el webhook pueda actualizarla directamente sin tener que buscarla.
+
+### Keep-alive
+
+El servidor Render se apaga tras 15 minutos de inactividad. Un tercer trigger programado cada 10 minutos hace `GET /health` para mantenerlo despierto durante trabajos largos.
 
 ---
 
-## Cómo Se Recuperan los Datos (El Flujo de Sesión)
+## Componente 2 — Servicio Request Scan
 
-Los portales de las empresas funcionan sobre **ASP.NET WebForms**, que almacena el estado del lado del servidor en una sesión vinculada a una cookie del navegador. Para recuperar los datos de cualquier ID de solicitud, el servicio debe replicar exactamente lo que haría un navegador — en cuatro pasos, todos dentro de la misma sesión:
+El servicio es una **API FastAPI** alojada en Render. Expone cuatro endpoints:
 
-```
-1. ValidaSolicitud        → Confirma que el ID existe
-2. Encryptar              → Obtiene un token cifrado y firmado por el servidor para ese ID
-3. GET WFSolicitud.aspx   → Carga la página del formulario con el token, inicializando la sesión del servidor
-4. CargarDatosSolicitud   → Llama al método de la página que retorna los datos
-```
-
-Restricción crítica: **los cuatro pasos deben usar la misma sesión HTTP** (la misma cookie). Si se dividen entre sesiones distintas, el estado del servidor establecido en el paso 3 no está disponible cuando se ejecuta el paso 4, y el servidor devuelve datos vacíos o incorrectos. El servicio crea una **sesión nueva por cada ID** para garantizar este aislamiento.
-
----
-
-## El Sistema de Eventos Webhook
-
-Cada endpoint recibe un `webhook_url`. A medida que el trabajo en segundo plano avanza, envía eventos JSON estructurados a esa URL:
-
-| Evento | Cuándo se dispara |
+| Endpoint | Propósito |
 |---|---|
-| `scan_started` / `audit_started` | El trabajo comienza |
-| `item` / `audit_item` | Un ID válido fue procesado exitosamente |
-| `item_error` | Un ID falló |
-| `status_change` | El estado de un ID monitoreado es diferente al último registrado |
-| `scan_finished` / `audit_finished` | El trabajo terminó con un resumen de estadísticas |
+| `POST /scan/range` | Escanea un rango numérico de IDs para descubrir cuáles existen |
+| `POST /status/refresh` | Verifica cambios de estado en IDs monitoreados |
+| `POST /audit/batch` | Obtiene el historial de auditoría para una lista de IDs conocidos |
+| `POST /fetch/batch` | Re-obtiene los datos completos del formulario para una lista de IDs |
 
-Cada evento incluye un `job_id` para que el receptor pueda correlacionar eventos de un trabajo de larga duración.
+Todos los endpoints responden **`202 Accepted` de inmediato** y ejecutan el trabajo real en un hilo de fondo. Los resultados se entregan de forma incremental vía webhook.
 
----
+### Cómo se recuperan los datos — El flujo de sesión ASP.NET
 
-## Estrategias de Escaneo (`/scan/range`)
+Los portales funcionan sobre **ASP.NET WebForms**, que almacena estado del lado del servidor vinculado a una cookie de sesión. Para recuperar los datos de un ID, el servicio debe replicar exactamente lo que haría un navegador en cuatro pasos consecutivos:
 
-El endpoint soporta dos estrategias de recorrido:
+```
+1. ValidaSolicitud        → Confirma que el ID existe en el portal
+2. Encryptar              → Obtiene un token cifrado y firmado por el servidor para ese ID
+3. GET WFSolicitud.aspx   → Carga la página del formulario con el token,
+                            inicializando el estado de sesión en el servidor
+4. CargarDatosSolicitud   → Llama al método que retorna los datos del formulario
+```
 
-- **`checkpoint`** (predeterminada): Solo sondea IDs cuyos dos últimos dígitos están en `{10, 30, 50, 70, 90}`. Cuando encuentra un ID válido, expande secuencialmente hasta encontrar el primer ID inválido, y luego salta al siguiente checkpoint. Mucho más rápida para rangos dispersos.
-- **`linear`**: Prueba cada ID del rango uno por uno. Usar cuando el rango es denso o cuando se requiere cobertura garantizada.
+**Restricción crítica:** los cuatro pasos deben usar la misma sesión HTTP (la misma cookie `ASP.NET_SessionId`). El servicio crea una **sesión nueva e independiente por cada ID** para garantizar este aislamiento.
 
----
+### Restricción de concurrencia
 
-## Restricción de Concurrencia
+Los servidores de las empresas tienen un error a nivel de IP: cuando dos solicitudes del mismo origen llegan simultáneamente, el servidor puede cruzar el estado en memoria entre sesiones y devolver datos del ID incorrecto. Por esta razón, **solo debe ejecutarse un trabajo a la vez** contra el mismo operador.
 
-Los servidores de las empresas tienen un error conocido de concurrencia a nivel de IP: cuando dos o más solicitudes del mismo origen llegan simultáneamente, el servidor puede contaminar el estado en memoria de las sesiones y devolver datos del ID incorrecto. Por esta razón, **solo debe ejecutarse un trabajo a la vez** contra el mismo operador. Ejecutar múltiples llamadas a `/scan/range` o `/fetch/batch` en paralelo producirá datos poco confiables.
+### Operadores soportados
 
----
-
-## Operadores
-
-| Clave del operador | Empresa | Portal |
+| Clave | Empresa | Portal |
 |---|---|---|
 | `"afinia"` | Energía Caribemar (Afinia) | `servicios.energiacaribemar.co` |
 | `"aire"` | Air-e | `servicios.air-e.com` |
 
-Air-e requiere configuración TLS adicional (soporte de renegociación heredada y un bundle de CA personalizado) que el servicio maneja automáticamente cuando se especifica `"operator": "aire"`. Al ejecutar trabajos de Air-e de forma local (fuera de Docker), el bundle de CA debe configurarse mediante la variable de entorno `AIRE_CA_BUNDLE`.
+Air-e requiere configuración TLS adicional (renegociación heredada + bundle de CA personalizado) que el servicio maneja automáticamente dentro de Docker.
+
+### Estrategias de escaneo (`/scan/range`)
+
+- **`linear`**: Prueba cada ID del rango uno por uno. Garantiza cobertura completa. Usada en producción.
+- **`checkpoint`**: Sondea solo IDs cuyos dos últimos dígitos están en `{10, 30, 50, 70, 90}` y expande alrededor de los hits. Más rápida para rangos dispersos.
 
 ---
 
-## Webhook Receptor — Google Apps Script (`/scan/range`)
+## Componente 3 — Google Sheets (Webhook Receptor)
 
-El webhook es una aplicación web desplegada en **Google Apps Script** que recibe los eventos enviados por el servicio y los escribe como filas en una hoja de cálculo de Google Sheets llamada `RAW`.
+Los webhooks son aplicaciones web desplegadas en **Google Apps Script** que reciben los eventos del servicio y los persisten en Google Sheets. Existen dos webhooks distintos, uno por cada flujo.
 
-### Estructura de la hoja
+### Webhook de `/scan/range` → escribe en hoja `RAW`
 
-La hoja `RAW` tiene dos tipos de columnas:
+Recibe eventos `item` (un ID válido encontrado con sus datos) y los convierte en filas nuevas en la hoja `RAW`.
 
-**Columnas fijas** (siempre presentes, en este orden):
+**Estructura de la hoja RAW:**
+
+*Columnas fijas* (siempre presentes):
 
 | Columna | Contenido |
 |---|---|
-| `ts` | Marca de tiempo del momento en que llegó el evento |
+| `ts` | Marca de tiempo del evento |
 | `event` | Tipo de evento (`item`, `item_error`, etc.) |
-| `job_id` | Identificador único del trabajo que generó el evento |
-| `id` | ID de la solicitud procesada |
-| `valid` | Si el ID fue encontrado como válido (`true` / `false`) |
+| `job_id` | ID del trabajo que generó el evento |
+| `id` | ID de la solicitud |
+| `valid` | Si el ID fue encontrado como válido |
 | `reason` | Razón del rechazo (si aplica) |
 | `error` | Mensaje de error (si aplica) |
 
-**Columnas dinámicas** (a partir de la columna 8): corresponden a los campos del objeto `data` devuelto por el portal (por ejemplo: `CONSECUTIVO`, `ESTADO`, `DESC_ESTADO`, `NOMBRE`, etc.). La última columna dinámica es siempre `raw_json`, que almacena el objeto completo en formato JSON compacto como respaldo.
+*Columnas dinámicas* (a partir de la columna 8): campos del formulario del portal (`CONSECUTIVO`, `ESTADO`, `DESC_ESTADO`, `NOMBRE`, `FEC_CREA`, `LATITUD`, `LONGITUD`, etc.). La última columna es siempre `raw_json` con el objeto completo como respaldo.
 
-### Flujo de procesamiento
-
-Cuando llega un evento al webhook, ocurre lo siguiente:
+**Flujo de procesamiento:**
 
 ```
-1. Se parsea el JSON del cuerpo del request
-2. Los eventos scan_started y scan_finished se ignoran (solo retornan "OK")
-3. Si la hoja está vacía, se crean las columnas fijas como encabezado
-4. Si el evento es "item" con valid=true y data presente:
-      → Se extrae el primer registro de data[]
-      → Se construye la fila: columnas fijas + columnas dinámicas mapeadas por encabezado
-      → Se agrega la fila al final de la hoja
-5. Para cualquier otro evento (item_error, etc.):
-      → Se escriben solo las columnas fijas
-      → Las columnas dinámicas quedan en blanco
-      → raw_json almacena data o valida_raw si están disponibles
+Llega evento al webhook
+  ├─ scan_started / scan_finished → se ignoran, retornan "OK"
+  ├─ "item" con valid=true y data presente:
+  │     → Se extrae el primer registro de data[]
+  │     → Se construye la fila mapeando cada campo al encabezado correspondiente
+  │     → Se agrega al final de RAW
+  └─ item_error u otros:
+        → Se escriben solo las columnas fijas
+        → raw_json almacena lo disponible
 ```
 
-### Conversión de valores
-
-Los valores del campo `data` pasan por una función de conversión antes de escribirse en la hoja:
-
-- **Fechas .NET** con formato `/Date(timestamp)/` → se convierten a objeto `Date` para que Sheets las formatee automáticamente. Las fechas con valor mínimo (`año 0001`) se tratan como vacías.
-- **Números** → se escriben tal cual.
-- **Texto** → se escribe tal cual.
-- **Objetos o arreglos** → se serializan como JSON.
-- **`null` o `undefined`** → se escriben como celda vacía.
-
-### Consideraciones importantes
-
-- Los encabezados de las columnas dinámicas **deben estar configurados manualmente** en la fila 1 de la hoja antes de iniciar un escaneo. La función `ensureDynamicHeaders` que los agrega automáticamente está desactivada por defecto para evitar escrituras innecesarias en la hoja.
-- Si llega un campo en `data` cuyo nombre no existe como encabezado en la hoja, ese campo **se omite silenciosamente**. El valor completo siempre queda disponible en la columna `raw_json`.
-- La hoja de cálculo asociada se identifica por su ID fijo en el código (`openById`). Si la hoja `RAW` no existe, se crea automáticamente.
+**Conversión de valores antes de escribir en Sheets:**
+- Fechas `.NET` `/Date(timestamp)/` → objeto `Date` (Sheets las formatea automáticamente)
+- Fechas con año 0001 (valor mínimo .NET) → celda vacía
+- Números → se escriben tal cual
+- Objetos o arreglos → se serializan como JSON
+- `null` / `undefined` → celda vacía
 
 ---
 
-## Webhook Receptor — Google Apps Script (`/status/refresh`)
+### Webhook de `/status/refresh` → actualiza `RAW` y escribe en `AUDIT`
 
-Este webhook recibe los eventos del endpoint `/status/refresh` y realiza dos acciones simultáneas sobre la hoja de cálculo: **actualiza el estado** en la hoja principal de solicitudes y **registra el historial de auditoría** en una hoja separada de solo adición.
+Recibe eventos `status_change` (solo cuando el estado de un ID cambió) y realiza dos acciones simultáneas:
 
-### Hojas involucradas
+**Acción 1 — Actualizar RAW:**
+```
+Si el evento trae sheet_row:
+  → Escribe directamente en esa fila  (O(1), una sola operación)
+Si no trae sheet_row:
+  → Busca el ID recorriendo la columna completa  (más lento)
+En ambos casos escribe: nuevo estado en col. 11, fecha de actualización en col. 105
+```
 
-| Hoja | Propósito |
+**Acción 2 — Agregar en AUDIT:**
+
+Todos los demás eventos (`status_refresh_started`, `status_refresh_finished`, `status_item_error`) son ignorados. Solo `status_change` genera escrituras.
+
+La hoja `AUDIT` es de **solo adición** — nunca se modifican filas existentes.
+
+**Estructura de la hoja AUDIT:**
+
+| Columna | Descripción |
 |---|---|
-| `RAW` | Hoja principal de solicitudes. Se actualiza cuando cambia el estado de un ID. |
-| `AUDIT` | Registro histórico de auditoría. Solo se agregan filas, nunca se modifican. |
+| `ts` | Momento en que llegó el evento al webhook |
+| `id` | ID de la solicitud |
+| `USUARIO` | Usuario que realizó la acción en el portal |
+| `ID_ACCION` | Código numérico de la acción |
+| `FECHA_AUDITORIA` | Fecha de la acción (convertida desde formato .NET) |
+| `ESTADO_AUDITORIA` | Estado registrado en esa entrada |
+| `OBSERVACION_AUDITORIA` | Texto de observación |
+| `DETALLE_AUDITORIA` | Detalle adicional |
+| `raw_json` | Objeto completo serializado como JSON |
+| `dedupe_key` | `"{id}\|{estado}"` — clave de deduplicación, siempre la última columna |
 
-### Eventos procesados
-
-A diferencia del webhook de `/scan/range`, este webhook **solo procesa el evento `status_change`**. Todos los demás eventos (`status_refresh_started`, `status_refresh_finished`, `status_item_error`, etc.) son ignorados y retornan `"IGNORED"`.
-
-Un evento `status_change` llega cuando el servicio detecta que el estado actual de un ID en el portal es diferente al último estado conocido.
-
-### Flujo de procesamiento ante un `status_change`
-
-```
-1. Se extrae del evento: id, new_status_text, new_status_code, sheet_row, audit[]
-
-2. Actualización en hoja RAW:
-   a. Si se proveyó sheet_row válido → escribe directamente en esa fila (O(1))
-   b. Si no → busca la fila recorriendo la columna de IDs y actualiza la primera coincidencia
-   En ambos casos se escribe: nuevo estado en columna 11, fecha de actualización en columna 105
-
-3. Registro de auditoría en hoja AUDIT:
-   a. Para cada entrada del arreglo audit[] recibido en el evento:
-      → Calcula una clave de deduplicación: "{id}|{estado_normalizado}"
-      → Si la clave ya existe en la hoja AUDIT, la entrada se omite
-      → Si es nueva, se agrega como fila al final de la hoja
-   b. Todas las filas nuevas se escriben en un solo batch para eficiencia
-```
-
-### Estructura de la hoja AUDIT
-
-| Columna | Campo | Descripción |
-|---|---|---|
-| `ts` | Marca de tiempo | Momento en que llegó el evento al webhook |
-| `id` | ID solicitud | ID de la solicitud |
-| `USUARIO` | Usuario | Usuario que realizó la acción en el portal |
-| `ID_ACCION` | Código de acción | Código numérico de la acción registrada |
-| `FECHA_AUDITORIA` | Fecha | Fecha de la acción (convertida desde formato .NET) |
-| `ESTADO_AUDITORIA` | Estado | Estado registrado en esa entrada de auditoría |
-| `OBSERVACION_AUDITORIA` | Observación | Texto de observación de la acción |
-| `DETALLE_AUDITORIA` | Detalle | Detalle adicional de la acción |
-| `raw_json` | JSON completo | Objeto completo de la entrada serializado como JSON |
-| `dedupe_key` | Clave de deduplicación | `"{id}\|{estado}"` — siempre la última columna |
-
-### Deduplicación
-
-Para evitar registrar la misma entrada de auditoría múltiples veces (por ejemplo, si `/status/refresh` se ejecuta varias veces sobre el mismo ID), cada fila de auditoría tiene una `dedupe_key` con el formato:
-
-```
-{id}|{estado_normalizado_en_minúsculas}
-```
-
-Antes de insertar cualquier fila, el webhook carga toda la columna `dedupe_key` en memoria y descarta las entradas cuya clave ya exista. Las filas nuevas se escriben en un único `setValues` al final.
-
-### Estrategia de actualización en RAW (O(1) vs búsqueda)
-
-El servicio puede enviar opcionalmente el campo `sheet_row` en el evento, indicando exactamente en qué fila de la hoja `RAW` está ese ID. Cuando está presente:
-- Se escribe directamente en esa fila → **una sola operación de escritura**.
-
-Cuando no está presente o es inválido:
-- Se lee toda la columna de IDs de `RAW` y se busca la primera fila que coincida → **más lento**, proporcional al número de registros.
-
-Para máximo rendimiento, se recomienda siempre proveer `sheet_row` en las solicitudes a `/status/refresh`.
+**Deduplicación:** antes de insertar, el webhook carga toda la columna `dedupe_key` en memoria y descarta entradas cuya clave ya exista. Esto evita duplicados si el refresh corre varias veces sobre el mismo ID.
 
 ---
 
-## Reporte en Looker Studio
+## Componente 4 — Reporte en Looker Studio
 
-El reporte de Looker Studio es la interfaz visual principal para explorar y filtrar todas las solicitudes capturadas por el servicio. Combina un mapa geográfico, una tabla de solicitudes y una tabla de auditoría, todos sincronizados con los mismos filtros.
+Looker Studio lee directamente las hojas `RAW` y `AUDIT` de Google Sheets. El reporte se actualiza automáticamente cuando los datos cambian en Sheets.
 
 > **Nota:** Al pie del reporte se muestra la **fecha de la última actualización**, que corresponde al momento en que los datos fueron refrescados desde Google Sheets.
-
----
 
 ### Filtros disponibles
 
@@ -228,7 +302,7 @@ El reporte de Looker Studio es la interfaz visual principal para explorar y filt
 | Filtro | Tipo | Descripción |
 |---|---|---|
 | **Selecciona un periodo** | Selector de fechas | Filtra solicitudes por rango de `FEC_CREA` |
-| **DESC_ESTADO** | Lista desplegable | Filtra por estado actual de la solicitud (ej. `De Baja`, `Solicitado`, `Aprobado`) |
+| **DESC_ESTADO** | Lista desplegable | Filtra por estado actual (ej. `De Baja`, `Solicitado`, `Aprobado`) |
 | **EMAIL_CLI** | Lista desplegable | Filtra por correo electrónico del cliente |
 | **TIPO** | Lista desplegable | Filtra por tipo de solicitud |
 | **id** | Campo de texto | Busca una solicitud por su ID exacto |
@@ -236,14 +310,14 @@ El reporte de Looker Studio es la interfaz visual principal para explorar y filt
 
 #### Filtro de distancia geográfica
 
-Este filtro permite encontrar todas las solicitudes dentro de un radio en kilómetros alrededor de un punto en el mapa.
+Encuentra todas las solicitudes dentro de un radio alrededor de un punto en el mapa.
 
 | Campo | Descripción |
 |---|---|
 | **lat** | Latitud del punto central, usando **coma** como separador decimal (ej. `8,751`) |
 | **long** | Longitud del punto central, usando **coma** como separador decimal (ej. `-75,87`) |
 | **distancia** | Radio de búsqueda en kilómetros (ej. `50`) |
-| **dentro_de_radio** | Seleccionar `1` para mostrar **solo** las solicitudes dentro del radio · Seleccionar `0` o vacío para mostrar todas |
+| **dentro_de_radio** | `1` → muestra solo las solicitudes dentro del radio · `0` o vacío → muestra todas |
 
 **Pasos para usar el filtro de distancia:**
 1. Ingresar la latitud con coma decimal en el campo **lat**
@@ -251,15 +325,13 @@ Este filtro permite encontrar todas las solicitudes dentro de un radio en kilóm
 3. Ingresar la distancia en kilómetros en el campo **distancia**
 4. Seleccionar `1` en el filtro **dentro_de_radio**
 
----
-
 ### Secciones del reporte
 
 #### Mapa
-Muestra la ubicación geográfica de cada solicitud usando sus campos `LATITUD` y `LONGITUD`. Los puntos se actualizan en tiempo real al aplicar cualquier filtro. Permite identificar visualmente concentraciones de solicitudes por zona.
+Muestra la ubicación geográfica de cada solicitud usando `LATITUD` y `LONGITUD`. Los puntos se actualizan en tiempo real al aplicar cualquier filtro. Permite identificar visualmente concentraciones de solicitudes por zona.
 
 #### Tabla de solicitudes
-Lista paginada (100 registros por página) con las columnas principales de cada solicitud:
+Lista paginada (100 registros por página):
 
 | Columna | Descripción |
 |---|---|
@@ -269,30 +341,28 @@ Lista paginada (100 registros por página) con las columnas principales de cada 
 | `EMAIL_CLI` | Correo del cliente |
 | `DESC_CIU...` | Ciudad (DESC_CIUDAD_PRO) |
 
-El contador superior derecho muestra el **total de registros** que coinciden con los filtros activos (ej. `1 - 100 / 17.610`).
+El contador superior derecho muestra el total de registros que coinciden con los filtros activos (ej. `1 - 100 / 17.610`).
 
 #### Tabla de auditoría
-Lista paginada con el historial de eventos de cada solicitud:
+Lista paginada con el historial de eventos por solicitud:
 
 | Columna | Descripción |
 |---|---|
-| `id` | ID de la solicitud a la que pertenece la entrada |
+| `id` | ID de la solicitud |
 | `FEC_CREA` | Fecha de creación de la solicitud |
-| `FECHA_AUDITORIA` | Fecha en que ocurrió el evento de auditoría |
+| `FECHA_AUDITORIA` | Fecha en que ocurrió el evento |
 | `ESTADO_AUDITORIA` | Estado registrado en ese momento |
 | `OBSERVACION_AUDITORIA` | Observación o detalle del evento |
 
-Esta tabla puede tener **más filas que la tabla de solicitudes** porque cada solicitud puede tener múltiples eventos de auditoría a lo largo del tiempo.
-
----
+Esta tabla tiene **más filas que la tabla de solicitudes** porque cada solicitud puede tener múltiples eventos de auditoría.
 
 ### Combinaciones de filtros frecuentes
 
 | Objetivo | Filtros a usar |
 |---|---|
-| Ver todas las solicitudes activas en una zona | `DESC_ESTADO` + `lat` / `long` / `distancia` / `dentro_de_radio = 1` |
-| Buscar el historial de una solicitud específica | `id` (campo de texto) |
-| Ver solicitudes creadas en un período | `Selecciona un periodo` |
+| Ver solicitudes activas en una zona | `DESC_ESTADO` + `lat` / `long` / `distancia` / `dentro_de_radio = 1` |
+| Buscar el historial de una solicitud | `id` (campo de texto) |
+| Ver solicitudes de un período | `Selecciona un periodo` |
 | Ver solicitudes de alta tensión pendientes | `TENSION_ENTREGADA` (deslizador) + `DESC_ESTADO` |
 | Filtrar por cliente | `EMAIL_CLI` |
 
@@ -300,20 +370,18 @@ Esta tabla puede tener **más filas que la tabla de solicitudes** porque cada so
 
 ## Herramienta de Consulta por Transformador — Google Apps Script
 
-Esta herramienta es un script de Google Apps Script independiente del servicio de escaneo. Su propósito es responder la pregunta: **¿qué solicitudes de generación solar están asociadas a una lista de transformadores?**
+Herramienta independiente del flujo de escaneo. Responde la pregunta: **¿qué solicitudes de generación solar están asociadas a una lista de transformadores?**
 
-El usuario sube una lista de códigos de transformador y el script cruza esa lista contra las bases de datos maestras de ambos operadores (Afinia y Air-e), enriquece los resultados con el historial de auditoría y aplica lógica de vencimiento, todo dentro de la misma hoja de cálculo.
+El usuario sube una lista de códigos de transformador y el script cruza esa lista contra las bases de datos maestras de Afinia y Air-e, enriquece con historial de auditoría y aplica lógica de vencimiento.
 
 ### Hojas involucradas
 
 | Hoja | Tipo | Propósito |
 |---|---|---|
-| `UPLOAD` | Entrada | El usuario pega aquí la lista de códigos de transformador (`COD_TRAFO_PRO`), uno por fila |
-| `RESULT` | Salida | El script escribe aquí el resultado del cruce. Se sobreescribe completamente en cada ejecución |
+| `UPLOAD` | Entrada | El usuario pega aquí los códigos de transformador (`COD_TRAFO_PRO`), uno por fila |
+| `RESULT` | Salida | El script escribe el resultado del cruce. Se sobreescribe en cada ejecución |
 
 ### Fuentes de datos maestras
-
-El script consulta cuatro hojas externas en dos libros de cálculo separados:
 
 | Fuente | Hoja | Operador | Contenido |
 |---|---|---|---|
@@ -326,7 +394,7 @@ Estas hojas son alimentadas por los webhooks del servicio de escaneo descritos e
 
 ### Cómo ejecutar
 
-1. Pegar los códigos de transformador en la hoja `UPLOAD` (una columna, una por fila, sin encabezado o con cualquier encabezado — el script lo reemplaza automáticamente)
+1. Pegar los códigos de transformador en la hoja `UPLOAD` (una columna, una por fila — el encabezado se fuerza automáticamente)
 2. Ir al menú **📂 Carga → Procesar archivo + Unir con MASTER**
 3. Ingresar la **fecha de corte** en formato `YYYY-MM-DD` cuando el script la solicite
 4. El resultado aparece en la hoja `RESULT`
@@ -347,28 +415,22 @@ Estas hojas son alimentadas por los webhooks del servicio de escaneo descritos e
 
 3. CRUCE (INNER JOIN)
    → Por cada código de transformador en UPLOAD:
-     se buscan todas las solicitudes en los datos maestros
-     que tengan ese mismo COD_TRAFO_PRO
-   → Solo se incluyen solicitudes que aparezcan en UPLOAD
-     (inner join: si no hay coincidencia, la fila se descarta)
+     se buscan todas las solicitudes con ese mismo COD_TRAFO_PRO
+   → Si no hay coincidencia, la fila se descarta
 
 4. FILTRO POR FECHA DE CORTE
-   → Se eliminan filas cuya FEC_CREA sea posterior a la fecha
-     de corte ingresada por el usuario
+   → Se eliminan filas cuya FEC_CREA sea posterior a la fecha de corte
 
 5. LÓGICA DE VENCIMIENTO
-   → Solo para solicitudes en estado:
-     "Pendiente documento", "Revisión documento" o "Solicitado"
+   → Solo para estados: "Pendiente documento", "Revisión documento" o "Solicitado"
    → Se calcula: fecha_ultimo_estado + 4 meses = calculated_date
    → Si calculated_date ≤ hoy → expired_flag = "EXPIRED"
    → Si calculated_date > hoy o el estado no aplica → expired_flag vacío
 
 6. EXPANSIÓN POR AUDITORÍA
-   → Por cada solicitud resultado del cruce:
-     si tiene entradas en AUDIT → se genera una fila por cada entrada
-     si no tiene auditoría → se genera una sola fila con las columnas de auditoría vacías
-   → Esto significa que una misma solicitud puede aparecer
-     múltiples veces en RESULT, una por cada evento de auditoría
+   → Si la solicitud tiene entradas en AUDIT → se genera una fila por cada entrada
+   → Si no tiene auditoría → se genera una sola fila con columnas de auditoría vacías
+   → Una misma solicitud puede aparecer múltiples veces en RESULT
 
 7. ESCRITURA EN RESULT
    → Se borra completamente la hoja RESULT
@@ -376,8 +438,6 @@ Estas hojas son alimentadas por los webhooks del servicio de escaneo descritos e
 ```
 
 ### Columnas del resultado (`RESULT`)
-
-La hoja `RESULT` combina columnas de tres fuentes en este orden:
 
 | Grupo | Columnas | Origen |
 |---|---|---|
@@ -387,8 +447,6 @@ La hoja `RESULT` combina columnas de tres fuentes en este orden:
 | Calculadas | `calculated_date`, `expired_flag` | Lógica del script |
 
 ### Comportamiento ante múltiples registros por transformador
-
-Un mismo código de transformador puede tener **varias solicitudes** asociadas, y cada solicitud puede tener **varios eventos de auditoría**. El resultado se expande en todas las combinaciones posibles:
 
 ```
 Transformador A → Solicitud 1001 → Auditoría: [Estado X, Estado Y]  →  2 filas
@@ -401,8 +459,6 @@ Transformador A → Solicitud 1001 → Auditoría: [Estado X, Estado Y]  →  2 
 
 ## Restricción de Alojamiento (Render Plan Gratuito)
 
-El servicio está alojado en el plan gratuito de Render en la siguiente URL:
+El servicio está alojado en el plan gratuito de Render: https://dashboard.render.com/web/srv-d73c6lmuk2gs73ef0jp0
 
-> https://dashboard.render.com/web/srv-d73c6lmuk2gs73ef0jp0
-
-El plan gratuito apaga el servidor tras **15 minutos de inactividad**. Cualquier trabajo en segundo plano en curso se cancela cuando esto ocurre. Para evitarlo durante trabajos de larga duración, una función de mantenimiento debe hacer ping a `GET /health` cada 10 minutos. Esto se realiza mediante un disparador programado por tiempo en Google Apps Script.
+El plan gratuito **apaga el servidor tras 15 minutos de inactividad**. Cualquier trabajo en segundo plano en curso se cancela cuando esto ocurre. Para evitarlo durante trabajos de larga duración, una función de mantenimiento en Google Apps Script hace ping a `GET /health` cada 10 minutos mediante un disparador programado por tiempo.
