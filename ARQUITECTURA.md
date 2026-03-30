@@ -78,6 +78,64 @@ Air-e requiere configuración TLS adicional (soporte de renegociación heredada 
 
 ---
 
+## Webhook Receptor — Google Apps Script (`/scan/range`)
+
+El webhook es una aplicación web desplegada en **Google Apps Script** que recibe los eventos enviados por el servicio y los escribe como filas en una hoja de cálculo de Google Sheets llamada `RAW`.
+
+### Estructura de la hoja
+
+La hoja `RAW` tiene dos tipos de columnas:
+
+**Columnas fijas** (siempre presentes, en este orden):
+
+| Columna | Contenido |
+|---|---|
+| `ts` | Marca de tiempo del momento en que llegó el evento |
+| `event` | Tipo de evento (`item`, `item_error`, etc.) |
+| `job_id` | Identificador único del trabajo que generó el evento |
+| `id` | ID de la solicitud procesada |
+| `valid` | Si el ID fue encontrado como válido (`true` / `false`) |
+| `reason` | Razón del rechazo (si aplica) |
+| `error` | Mensaje de error (si aplica) |
+
+**Columnas dinámicas** (a partir de la columna 8): corresponden a los campos del objeto `data` devuelto por el portal (por ejemplo: `CONSECUTIVO`, `ESTADO`, `DESC_ESTADO`, `NOMBRE`, etc.). La última columna dinámica es siempre `raw_json`, que almacena el objeto completo en formato JSON compacto como respaldo.
+
+### Flujo de procesamiento
+
+Cuando llega un evento al webhook, ocurre lo siguiente:
+
+```
+1. Se parsea el JSON del cuerpo del request
+2. Los eventos scan_started y scan_finished se ignoran (solo retornan "OK")
+3. Si la hoja está vacía, se crean las columnas fijas como encabezado
+4. Si el evento es "item" con valid=true y data presente:
+      → Se extrae el primer registro de data[]
+      → Se construye la fila: columnas fijas + columnas dinámicas mapeadas por encabezado
+      → Se agrega la fila al final de la hoja
+5. Para cualquier otro evento (item_error, etc.):
+      → Se escriben solo las columnas fijas
+      → Las columnas dinámicas quedan en blanco
+      → raw_json almacena data o valida_raw si están disponibles
+```
+
+### Conversión de valores
+
+Los valores del campo `data` pasan por una función de conversión antes de escribirse en la hoja:
+
+- **Fechas .NET** con formato `/Date(timestamp)/` → se convierten a objeto `Date` para que Sheets las formatee automáticamente. Las fechas con valor mínimo (`año 0001`) se tratan como vacías.
+- **Números** → se escriben tal cual.
+- **Texto** → se escribe tal cual.
+- **Objetos o arreglos** → se serializan como JSON.
+- **`null` o `undefined`** → se escriben como celda vacía.
+
+### Consideraciones importantes
+
+- Los encabezados de las columnas dinámicas **deben estar configurados manualmente** en la fila 1 de la hoja antes de iniciar un escaneo. La función `ensureDynamicHeaders` que los agrega automáticamente está desactivada por defecto para evitar escrituras innecesarias en la hoja.
+- Si llega un campo en `data` cuyo nombre no existe como encabezado en la hoja, ese campo **se omite silenciosamente**. El valor completo siempre queda disponible en la columna `raw_json`.
+- La hoja de cálculo asociada se identifica por su ID fijo en el código (`openById`). Si la hoja `RAW` no existe, se crea automáticamente.
+
+---
+
 ## Restricción de Alojamiento (Render Plan Gratuito)
 
 El servicio está alojado en el plan gratuito de Render, que apaga el servidor tras **15 minutos de inactividad**. Cualquier trabajo en segundo plano en curso se cancela cuando esto ocurre. Para evitarlo durante trabajos de larga duración, una función de mantenimiento debe hacer ping a `GET /health` cada 10 minutos. Esto se realiza mediante un disparador programado por tiempo en Google Apps Script.
